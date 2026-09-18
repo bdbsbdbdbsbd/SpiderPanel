@@ -1,0 +1,14 @@
+# Local runtime state (contains real panel keys/sessions — never publish)
+data/spider_state.json
+*.state.json
+
+# Runtime artifacts
+__pycache__/
+*.pyc
+xray/
+.venv/
+venv/
+
+# Environment/credentials
+.env
+.env.*
