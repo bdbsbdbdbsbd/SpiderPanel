@@ -226,7 +226,7 @@ def _validate_listener_port(port: int, exclude_id: str | None = None) -> None:
 
 
 async def load_state():
-    global LINKS, AUTH, SUBS, USERS, SETTINGS, GROUPS, IP_POOL, IP_BLACKLIST, INBOUNDS, NODES, PENDING_NODE_DELETIONS, SUB_HASH_INDEX
+    global LINKS, AUTH, SUBS, USERS, SETTINGS, GROUPS, IP_POOL, IP_BLACKLIST, INBOUNDS, NODES, PENDING_NODE_DELETIONS, SUB_HASH_INDEX, SUB_HASH_RECORDS, SUB_HASH_REVOKED, CURRENT_SUB_HASH
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if DATA_FILE.exists():
@@ -282,6 +282,13 @@ async def load_state():
                     WORKER["connected"] = True
             SUB_HASH_INDEX.clear()
             SUB_HASH_INDEX.update(data.get("sub_hash_index", {}) or {})
+            # Worker-style hash records / tombstones / active-hash map (validateSubHash state)
+            SUB_HASH_RECORDS.clear()
+            SUB_HASH_RECORDS.update(data.get("sub_hash_records", {}) or {})
+            SUB_HASH_REVOKED.clear()
+            SUB_HASH_REVOKED.update(data.get("sub_hash_revoked", []) or [])
+            CURRENT_SUB_HASH.clear()
+            CURRENT_SUB_HASH.update(data.get("sub_hash_current", {}) or {})
             logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs, {len(USERS)} users, {len(GROUPS)} groups, {len(IP_POOL)} ips, {len(INBOUNDS)} inbounds, {len(NODES)} nodes")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
@@ -422,6 +429,9 @@ async def save_state():
                 "password_hash": AUTH["password_hash"],
                 "saved_secret": CONFIG["secret"],
                 "sub_hash_index": dict(SUB_HASH_INDEX),
+                "sub_hash_records": dict(SUB_HASH_RECORDS),
+                "sub_hash_revoked": sorted(SUB_HASH_REVOKED),
+                "sub_hash_current": dict(CURRENT_SUB_HASH),
                 "saved_at": datetime.now().isoformat(),
             }
             tmp = DATA_FILE.with_suffix(".tmp")
@@ -3053,32 +3063,196 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         }
     )
 
-# ── Worker-style per-user subscription by hash (mirrors user.js `/sub/{hash}`) ─
-# The hash is a 44-char URL-safe token; the route supports every format the
-# Cloudflare worker panel exposes (raw/base64, uri, clash, singbox, vjson) with
-# the same response headers (subscription-userinfo, profile-title, ...).
+# ── Worker-style hashed subscription system (1:1 with the user.js worker) ────
+# URL surface (mirrors the Cloudflare worker exactly):
+#   GET  /sub/{hash}                → configs (raw base64 / clash yaml /
+#                                     sing-box json / v2rayN json) or the HTML
+#                                     portal for real browsers
+#   GET  /api/subscription/{hash}   → JSON status (usage / expiry / status)
+#   POST /api/subscription/{hash}   → redeem stub (worker-compatible errors)
+#   GET  /sub/{hash}/api            → legacy alias of the JSON status API
+#
+# The 44-char hash is pad44(sha256_base64url(`${uuid}|${sub}|${salt}|${ts}|${nonce}`))
+# exactly like the worker's generateSubHash(). Rotation tombstones every older
+# hash of the same user so stale links die with HTTP 410, mirroring the
+# worker's `sub_hash:{h} = ""` records.
 
-SUB_HASH_INDEX: dict = {}  # 44-char hash -> config_uuid (persisted)
+import hmac as _hmac
+
+SUB_HASH_INDEX: dict = {}      # 44-char hash -> config_uuid (persisted, legacy index)
+SUB_HASH_RECORDS: dict = {}    # hash -> {"userId": uuid, "sub": name, "ts": ms, "v": 1} (persisted)
+SUB_HASH_REVOKED: set = set()  # tombstoned hashes (persisted) — rotated/revoked links
+CURRENT_SUB_HASH: dict = {}    # config_uuid -> active hash (persisted; mirrors user.subHash)
 
 _SUB_HASH_RE = re.compile(r"^[A-Za-z0-9_-]{44}$")
 _WORKER_SUB_VERSION = "9.5.50"
+_SUB_BRAND = "Spider"
+_SUB_B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+# Mirrors the worker's per-isolate config-output cache (TTL 15s, 512 entries,
+# 1MB body cap) so repeated sub fetches stay cheap and consistent.
+_CONFIG_OUTPUT_CACHE: dict = {}
+_CONFIG_OUTPUT_CACHE_TTL = 15.0
+_CONFIG_OUTPUT_CACHE_MAX = 512
+_CONFIG_OUTPUT_CACHE_MAX_BYTES = 1048576
 
 
-def ensure_sub_hash(config_uuid: str) -> str:
-    """Return the stable worker-style sub hash for a config UUID, creating one."""
+def _sub_persist() -> None:
+    """Best-effort async state save after hash lifecycle changes."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no running loop — the periodic saver will persist it
+    loop.create_task(save_state())
+
+
+# ── Hash generation (worker generateSubHash) ─────────────────────────────────
+def _pad44(b64url: str) -> str:
+    """worker pad44(): clip to 44 chars or append a checksum char."""
+    if len(b64url) >= 44:
+        return b64url[:44]
+    s = 0
+    for ch in b64url:
+        s = (s + ord(ch)) & 0xFFFF
+    return b64url + _SUB_B64_ALPHABET[s % len(_SUB_B64_ALPHABET)]
+
+
+def _sha256_b64url(text: str) -> str:
+    """worker sha256Base64Url(): SHA-256 → base64 → url-safe, '=' stripped."""
+    return base64.urlsafe_b64encode(hashlib.sha256(text.encode("utf-8")).digest()).decode("ascii").rstrip("=")
+
+
+def _to_base36(n: int) -> str:
+    if n <= 0:
+        return "0"
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while n:
+        n, r = divmod(n, 36)
+        out = digits[r] + out
+    return out
+
+
+def _crypto_nonce(nbytes: int = 12) -> str:
+    """worker cryptoNonce(): random bytes → hex → BigInt → base36."""
+    return _to_base36(int.from_bytes(secrets.token_bytes(nbytes), "big"))
+
+
+def _ct_eq(a: str, b: str) -> bool:
+    """Constant-time string compare (mirrors constantTimeEqual)."""
+    return _hmac.compare_digest(str(a or ""), str(b or ""))
+
+
+def _ensure_sub_hash_salt() -> str:
+    """worker ensureSecretSalt(): one persistent 64-hex salt in settings."""
+    salt = str(SETTINGS.get("sub_hash_salt") or "").strip()
+    if len(salt) >= 32:
+        return salt
+    salt = secrets.token_hex(32)
+    SETTINGS["sub_hash_salt"] = salt
+    _sub_persist()
+    return salt
+
+
+def generate_sub_hash(config_uuid: str, sub: str = "") -> str:
+    """worker generateSubHash(): issue a fresh 44-char hash. Every previous
+    hash of the same user is tombstoned (rotation ⇒ old links return 410)."""
     config_uuid = str(config_uuid or "").strip().lower()
+    sub = str(sub or "").strip()
     if not config_uuid:
         return ""
-    for h, cu in SUB_HASH_INDEX.items():
-        if cu == config_uuid:
-            return h
-    h = secrets.token_urlsafe(33)  # 44 chars, matches ^[A-Za-z0-9_-]{44}$
+    ts = int(time.time() * 1000)
+    nonce = _crypto_nonce(12)
+    raw = f"{config_uuid}|{sub}|{_ensure_sub_hash_salt()}|{ts}|{nonce}"
+    h = _pad44(_sha256_b64url(raw))
+    # Revoke the previously active hash of this user (worker tombstones them).
+    prev = str(CURRENT_SUB_HASH.get(config_uuid) or "")
+    if prev and prev != h:
+        SUB_HASH_REVOKED.add(prev)
+        SUB_HASH_RECORDS.pop(prev, None)
+        SUB_HASH_INDEX.pop(prev, None)
+    # Revoke any other recorded hash of this user (same userId ⇒ dead).
+    for old_h, old_rec in list(SUB_HASH_RECORDS.items()):
+        if old_h != h and str(old_rec.get("userId") or "") == config_uuid:
+            SUB_HASH_REVOKED.add(old_h)
+            SUB_HASH_RECORDS.pop(old_h, None)
+            SUB_HASH_INDEX.pop(old_h, None)
+    SUB_HASH_RECORDS[h] = {"userId": config_uuid, "sub": sub, "ts": ts, "v": 1}
     SUB_HASH_INDEX[h] = config_uuid
+    SUB_HASH_REVOKED.discard(h)
+    CURRENT_SUB_HASH[config_uuid] = h
+    _sub_persist()
     return h
 
 
-def _sub_hash_to_uuid(hash: str) -> str | None:
-    return SUB_HASH_INDEX.get(hash)
+def ensure_sub_hash(config_uuid: str) -> str:
+    """worker getOrCreateSubHash(): reuse the active hash, else re-issue one."""
+    config_uuid = str(config_uuid or "").strip().lower()
+    if not config_uuid:
+        return ""
+    cur = str(CURRENT_SUB_HASH.get(config_uuid) or "")
+    if cur and _SUB_HASH_RE.match(cur) and cur in SUB_HASH_RECORDS and cur not in SUB_HASH_REVOKED:
+        return cur
+    cands = sorted(
+        ((int(rec.get("ts") or 0), hh) for hh, rec in SUB_HASH_RECORDS.items()
+         if str(rec.get("userId") or "") == config_uuid and hh not in SUB_HASH_REVOKED),
+        reverse=True,
+    )
+    if cands:
+        hh = cands[0][1]
+        CURRENT_SUB_HASH[config_uuid] = hh
+        _sub_persist()
+        return hh
+    # Legacy: adopt an index-only hash so pre-upgrade links stay valid.
+    for hh, uu in SUB_HASH_INDEX.items():
+        if uu == config_uuid and hh not in SUB_HASH_REVOKED:
+            SUB_HASH_RECORDS.setdefault(hh, {"userId": config_uuid, "sub": "", "ts": 0, "v": 1})
+            CURRENT_SUB_HASH[config_uuid] = hh
+            _sub_persist()
+            return hh
+    return generate_sub_hash(config_uuid)
+
+
+def rotate_sub_hash(config_uuid: str, sub: str = "") -> str:
+    """Explicit link re-issue (bot "newlink" flow): old links immediately 410."""
+    return generate_sub_hash(config_uuid, sub)
+
+
+def validate_sub_hash(sub_hash: str):
+    """worker validateSubHash(). Returns:
+      None                                  → malformed/unknown  ⇒ 404 invalid_hash
+      {"revoked": True, ...}                → tombstone/rotated  ⇒ 410 revoked_hash
+      {"revoked": False, "config_uuid", …}  → valid record
+    """
+    if not sub_hash or not isinstance(sub_hash, str) or len(sub_hash) != 44 or not _SUB_HASH_RE.match(sub_hash):
+        return None
+    if sub_hash in SUB_HASH_REVOKED:
+        return {"revoked": True, "config_uuid": None, "sub": "", "issuedAt": 0, "hash": sub_hash}
+    rec = SUB_HASH_RECORDS.get(sub_hash)
+    config_uuid = (str(rec.get("userId") or "") if rec else "") or SUB_HASH_INDEX.get(sub_hash)
+    if not config_uuid:
+        return None
+    # Rotation kills the old link even if its record still exists somewhere.
+    cur = str(CURRENT_SUB_HASH.get(config_uuid) or "")
+    if cur and _SUB_HASH_RE.match(cur) and not _ct_eq(cur, sub_hash):
+        return {
+            "revoked": True, "config_uuid": None, "sub": "",
+            "issuedAt": int(rec.get("ts") or 0) if rec else 0, "hash": sub_hash,
+        }
+    return {
+        "revoked": False,
+        "config_uuid": str(config_uuid),
+        "sub": (str(rec.get("sub") or "") if rec else ""),
+        "issuedAt": (int(rec.get("ts") or 0) if rec else 0),
+        "hash": sub_hash,
+    }
+
+
+def _sub_hash_to_uuid(sub_hash: str) -> "str | None":
+    rec = validate_sub_hash(sub_hash)
+    if not rec or rec.get("revoked"):
+        return None
+    return rec.get("config_uuid")
 
 
 def get_bot_sub_link(config_uuid: str) -> str:
@@ -3090,7 +3264,75 @@ def get_bot_sub_link(config_uuid: str) -> str:
     return f"https://{host}/sub/{h}"
 
 
+# ── Config output cache (mirrors configOutputCache*) ─────────────────────────
+def _config_cache_get(key: str):
+    hit = _CONFIG_OUTPUT_CACHE.get(key)
+    if not hit:
+        return None
+    body, created, _last = hit
+    if time.time() - created > _CONFIG_OUTPUT_CACHE_TTL:
+        _CONFIG_OUTPUT_CACHE.pop(key, None)
+        return None
+    _CONFIG_OUTPUT_CACHE[key] = (body, created, time.time())
+    return body
+
+
+def _config_cache_put(key: str, body) -> None:
+    try:
+        size = len(body[0].encode("utf-8")) if isinstance(body, tuple) else len(str(body).encode("utf-8"))
+    except Exception:
+        return
+    if size > _CONFIG_OUTPUT_CACHE_MAX_BYTES:
+        return
+    _CONFIG_OUTPUT_CACHE[key] = (body, time.time(), time.time())
+    if len(_CONFIG_OUTPUT_CACHE) > _CONFIG_OUTPUT_CACHE_MAX:
+        oldest = min(_CONFIG_OUTPUT_CACHE.items(), key=lambda kv: kv[1][2])
+        _CONFIG_OUTPUT_CACHE.pop(oldest[0], None)
+
+
+# ── Client detection & format aliases (worker detectClientType) ──────────────
+_SUB_FORMAT_ALIASES = {  # worker formatToFlag
+    "clash": "clash", "yaml": "clash", "meta": "clash", "stash": "clash",
+    "singbox": "singbox", "sing-box": "singbox", "sb": "singbox",
+    "raw": "raw", "v2ray": "raw", "base64": "raw",
+    "vjson": "vjson", "v2rayn": "vjson",
+}
+
+
+def _detect_sub_client(ua: str) -> str:
+    """Exact port of the worker's detectClientType()."""
+    u = re.sub(r"[\x00-\x1f\x7f]", "", str(ua or ""))[:180].lower()
+    if not u:
+        return "unknown"
+    if "hiddify" in u or "nekobox" in u or "nekoray" in u or "v2box" in u:
+        return "raw"
+    if "clash" in u or "meta" in u or "stash" in u or "verge" in u or "mihomo" in u or "cfw" in u:
+        return "clash"
+    if "sing-box" in u or "singbox" in u or "sfa" in u or "karing" in u:
+        return "singbox"
+    if ("v2rayng" in u or "v2rayn" in u or "v2ray" in u or "shadowrocket" in u
+            or "quantumult" in u or "surfboard" in u or "streisand" in u):
+        return "raw"
+    if "mozilla" in u or "chrome" in u or "safari" in u or "firefox" in u or "edge" in u or "opera" in u:
+        return "browser"
+    return "unknown"
+
+
+def _is_browser_ua(ua: str, accept: str) -> bool:
+    """Exact port of the worker's isBrowser check used on the sub routes."""
+    low = (ua or "").lower()
+    if "text/html" not in (accept or ""):
+        return False
+    if not re.search(r"mozilla|chrome|safari|firefox|edge|opera", low):
+        return False
+    if re.search(r"v2ray|clash|sing-box|hiddify|nekobox|shadowrocket|quantumult|streisand", low):
+        return False
+    return True
+
+
+# ── Share-link parsing / splitting ───────────────────────────────────────────
 def _sub_configs_from_data(data: dict) -> list:
+    """Real (non-info) VLESS share-links, like the worker's URI profile lines."""
     cfg = []
     for c in data.get("configs") or []:
         if c and "vless://" in c and "%F0%9F%93%8A" not in c:
@@ -3100,9 +3342,28 @@ def _sub_configs_from_data(data: dict) -> list:
     return cfg
 
 
+def _sub_info_names(data: dict) -> list:
+    """Usage/expiry info entries (the 📊 status link) → sing-box "info" nodes,
+    mirroring the worker's getFakeConfigNames() output."""
+    names = []
+    for c in data.get("configs") or []:
+        if not c or "vless://" not in c:
+            continue
+        if "%F0%9F%93%8A" not in c:
+            continue
+        try:
+            frag = c.split("#", 1)[1] if "#" in c else ""
+            txt = unquote(frag).strip()
+        except Exception:
+            txt = ""
+        if txt and txt not in names:
+            names.append(txt)
+    return names[:20]
+
+
 def _sub_node_parts(uri: str) -> dict:
     """Parse a `vless://uuid@address:port?params#remark` share-link into parts."""
-    parts: dict = {"remark": "Spider"}
+    parts: dict = {"remark": _SUB_BRAND}
     try:
         body, _, frag = uri.partition("#")
         frag = unquote(frag)
@@ -3137,156 +3398,376 @@ def _sub_node_parts(uri: str) -> dict:
     return parts
 
 
+def _unique_namer():
+    """worker getUniqueName()/uniq(): deduplicate node names with -N suffixes."""
+    counts: dict = {}
+
+    def uniq(base):
+        base = str(base or "Node")
+        if base not in counts:
+            counts[base] = 1
+            return base
+        c = counts[base]
+        new = f"{base}-{c}"
+        while new in counts:
+            c += 1
+            new = f"{base}-{c}"
+        counts[base] = c + 1
+        counts[new] = 1
+        return new
+
+    return uniq
+
+
 def _build_sub_uri_text(configs: list) -> str:
     """Text form: one VLESS share-link per line (like buildUriProfile)."""
     return "\n".join(configs)
 
 
-def _build_clash_yaml_body(configs: list, allow_insecure: bool = False) -> str:
+# ── Format builders (worker buildYamlProfile / buildSingBoxJsonProfile / …) ──
+def _build_clash_yaml_body(data: dict, allow_insecure: bool = False) -> str:
+    """Full Clash Meta/Mihomo YAML — layout identical to buildYamlProfile."""
+    uniq = _unique_namer()
     proxies = []
     names = []
-    for uri in configs:
-        parts = _sub_node_parts(uri)
-        name = parts.get("remark") or "Spider"
-        fp = (parts.get("fp") or "chrome").replace(" ", "")
-        proxies.append(
+    insecure_txt = str(bool(allow_insecure)).lower()
+    for uri in _sub_configs_from_data(data):
+        p = _sub_node_parts(uri)
+        name = uniq(p.get("remark") or _SUB_BRAND)
+        network = p.get("type") or "ws"
+        block = (
             f'- name: "{name}"\n'
             f"  type: vless\n"
-            f"  server: {parts['address']}\n"
-            f"  port: {parts['port']}\n"
-            f"  uuid: {parts['uuid']}\n"
+            f"  server: {p['address']}\n"
+            f"  port: {p['port']}\n"
+            f"  uuid: {p['uuid']}\n"
             f"  udp: true\n"
-            f"  tls: {str((parts.get('security') == 'tls')).lower()}\n"
-            f"  servername: {parts['sni']}\n"
-            f"  client-fingerprint: {fp}\n"
-            f"  network: {parts.get('type') or 'ws'}\n"
-            f"  ws-opts:\n"
-            f"    max-early-data: 2560\n"
-            f"    early-data-header-name: Sec-WebSocket-Protocol\n"
-            f'    path: "{parts.get("path", "")}"\n'
-            f"    headers:\n"
-            f"      Host: {parts['host']}\n"
-            f"  skip-cert-verify: {str(bool(allow_insecure)).lower()}"
+            f"  tls: {str(p.get('security') == 'tls').lower()}\n"
+            f"  servername: {p['sni']}\n"
+            f"  client-fingerprint: {p.get('fp') or 'random'}\n"
+            f"  network: {network}\n"
         )
+        if network == "ws":
+            block += (
+                f"  ws-opts:\n"
+                f"    max-early-data: 2560\n"
+                f"    early-data-header-name: Sec-WebSocket-Protocol\n"
+                f'    path: "{p.get("path", "")}"\n'
+                f"    headers:\n"
+                f"      Host: {p['host']}\n"
+            )
+        block += f"  skip-cert-verify: {insecure_txt}"
+        proxies.append(block)
         names.append(name)
     if not proxies:
         return ""
-    names_q = "\n".join('      - "{}"'.format(n.replace('\\', '').replace('"', '\\"')) for n in names)
+    refs = "\n".join('      - "{}"'.format(n.replace("\\", "").replace('"', '\\"')) for n in names)
     return (
         "mixed-port: 7890\n"
         "ipv6: true\n"
         "allow-lan: false\n"
+        "unified-delay: false\n"
         "log-level: warning\n"
         "mode: rule\n"
+        "disable-keep-alive: false\n"
+        "keep-alive-idle: 10\n"
+        "keep-alive-interval: 15\n"
+        "tcp-concurrent: true\n"
         "geo-auto-update: true\n"
+        "geo-update-interval: 168\n"
+        "external-controller: 127.0.0.1:9090\n"
+        "external-controller-cors:\n"
+        "  allow-origins:\n"
+        "    - \"*\"\n"
+        "  allow-private-network: true\n"
+        "external-ui: ui\n"
+        "external-ui-url: \"https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip\"\n"
+        "\n"
+        "profile:\n"
+        "  store-selected: true\n"
+        "  store-fake-ip: true\n"
+        "\n"
+        "dns:\n"
+        "  enable: true\n"
+        "  respect-rules: true\n"
+        "  use-system-hosts: false\n"
+        "  listen: 127.0.0.1:1053\n"
+        "  ipv6: true\n"
+        "  hosts:\n"
+        "    \"rule-set:category-ads-all\": \"rcode://refused\"\n"
+        "  nameserver:\n"
+        "    - \"https://8.8.8.8/dns-query#✅ Selector\"\n"
+        "  proxy-server-nameserver:\n"
+        "    - \"8.8.8.8#DIRECT\"\n"
+        "  direct-nameserver:\n"
+        "    - \"8.8.8.8#DIRECT\"\n"
+        "  direct-nameserver-follow-policy: true\n"
+        "  enhanced-mode: redir-host\n"
+        "\n"
         "tun:\n"
         "  enable: true\n"
         "  stack: mixed\n"
         "  auto-route: true\n"
-        "  auto-detect-interface: true\n\n"
-        "proxies:\n" + "\n".join(proxies) + "\n\n"
+        "  strict-route: true\n"
+        "  auto-detect-interface: true\n"
+        "  dns-hijack:\n"
+        "    - \"any:53\"\n"
+        "    - \"tcp://any:53\"\n"
+        "  mtu: 9000\n"
+        "\n"
+        "sniffer:\n"
+        "  enable: true\n"
+        "  force-dns-mapping: true\n"
+        "  parse-pure-ip: true\n"
+        "  override-destination: true\n"
+        "  sniff:\n"
+        "    HTTP:\n"
+        "      ports: [80, 8080, 8880, 2052, 2082, 2086, 2095]\n"
+        "    TLS:\n"
+        "      ports: [443, 8443, 2053, 2083, 2087, 2096]\n"
+        "\n"
+        "proxies:\n"
+        + "\n".join(proxies) + "\n"
+        "\n"
         "proxy-groups:\n"
-        '  - name: "✅ Selector"\n'
+        "  - name: \"✅ Selector\"\n"
         "    type: select\n"
-        "    proxies:\n" + names_q + "\n"
-        '  - name: " Best Ping "\n'
+        "    proxies:\n"
+        "      - \" Best Ping \"\n"
+        + refs + "\n"
+        "  - name: \" Best Ping \" \n"
         "    type: url-test\n"
-        '    url: "https://www.gstatic.com/generate_204"\n'
+        "    url: \"https://www.gstatic.com/generate_204\"\n"
         "    interval: 30\n"
         "    tolerance: 50\n"
-        "    proxies:\n" + names_q + "\n\n"
+        "    proxies:\n"
+        + refs + "\n"
+        "\n"
         "rules:\n"
         "  - DOMAIN-SUFFIX,ir,DIRECT\n"
         "  - DOMAIN-KEYWORD,gov.ir,DIRECT\n"
+        "  - DOMAIN-SUFFIX,fa,DIRECT\n"
         "  - GEOIP,IR,DIRECT\n"
-        "  - MATCH,✅ Selector\n"
+        "  - MATCH,🇮‌ Selector\n"
     )
 
 
-def _build_singbox_body(configs: list, allow_insecure: bool = False) -> str:
-    """JSON array of sing-box vless outbounds (worker's buildSingBoxJsonProfile)."""
+def _build_singbox_body(data: dict, allow_insecure: bool = False) -> str:
+    """Full Sing-box profile JSON — structure identical to buildSingBoxJsonProfile."""
+    uniq = _unique_namer()
     outbounds = []
-    for uri in configs:
-        parts = _sub_node_parts(uri)
-        outbounds.append({
+    fake_refs = []
+    # Usage/expiry info entries as {type: direct} placeholders (worker behaviour).
+    for nm in _sub_info_names(data):
+        outbounds.append({"type": "direct", "tag": nm})
+        fake_refs.append(nm)
+    dynamic_tags = []
+    for uri in _sub_configs_from_data(data):
+        p = _sub_node_parts(uri)
+        tag = uniq(p.get("remark") or _SUB_BRAND)
+        dynamic_tags.append(tag)
+        ob = {
             "type": "vless",
-            "tag": parts.get("remark") or "Spider",
-            "server": parts["address"],
-            "server_port": int(parts["port"]),
+            "tag": tag,
+            "server": p["address"],
+            "server_port": int(p["port"]),
+            "tcp_fast_open": False,
+            "uuid": p["uuid"],
             "packet_encoding": "xudp",
-            "uuid": parts["uuid"],
             "network": "tcp",
             "tls": {
-                "enabled": parts.get("security") == "tls",
-                "server_name": parts["sni"],
+                "enabled": p.get("security") == "tls",
+                "server_name": p["sni"],
                 "insecure": bool(allow_insecure),
                 "alpn": ["http/1.1"],
                 "utls": {"enabled": True, "fingerprint": "randomized"},
             },
-            "transport": {
+        }
+        if (p.get("type") or "ws") == "ws":
+            ob["transport"] = {
                 "type": "ws",
-                "path": parts["path"],
+                "path": p["path"],
                 "max_early_data": 2560,
                 "early_data_header_name": "Sec-WebSocket-Protocol",
-                "headers": {"Host": parts["host"]},
+                "headers": {"Host": p["host"]},
+            }
+        outbounds.append(ob)
+    profile = {
+        "log": {"disabled": False, "level": "warn", "timestamp": True},
+        "dns": {
+            "servers": [
+                {"address": "https://8.8.8.8/dns-query", "detour": "✅ Selector", "tag": "dns-remote"},
+                {"address": "8.8.8.8", "detour": "direct", "tag": "dns-direct"},
+            ],
+            "rules": [
+                {"clash_mode": "Direct", "server": "dns-direct"},
+                {"clash_mode": "Global", "server": "dns-remote"},
+                {"query_type": ["HTTPS"], "action": "reject"},
+                {"rule_set": ["geosite-category-ads-all"], "action": "reject"},
+                {
+                    "type": "logical",
+                    "mode": "and",
+                    "rules": [
+                        {"rule_set": ["geosite-ir"]},
+                        {"rule_set": "geoip-ir"},
+                    ],
+                    "action": "route",
+                    "server": "dns-direct",
+                },
+            ],
+            "strategy": "prefer_ipv4",
+            "independent_cache": True,
+        },
+        "inbounds": [
+            {
+                "type": "tun",
+                "tag": "tun-in",
+                "address": ["172.19.0.1/28"],
+                "mtu": 9000,
+                "auto_route": True,
+                "strict_route": True,
+                "stack": "mixed",
             },
-        })
-    return json.dumps(outbounds, ensure_ascii=False)
+            {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080},
+        ],
+        "outbounds": [
+            *outbounds,
+            {
+                "type": "selector",
+                "tag": "✅ Selector",
+                "outbounds": [" Best Ping ", *fake_refs, *dynamic_tags],
+                "interrupt_exist_connections": False,
+            },
+            {"type": "direct", "tag": "direct"},
+            {
+                "type": "urltest",
+                "tag": " Best Ping ",
+                "outbounds": [*dynamic_tags],
+                "url": "https://www.gstatic.com/generate_204",
+                "interrupt_exist_connections": False,
+                "interval": "30s",
+            },
+        ],
+        "route": {
+            "rules": [
+                {"ip_cidr": "172.19.0.2", "action": "hijack-dns"},
+                {"clash_mode": "Direct", "outbound": "direct"},
+                {"clash_mode": "Global", "outbound": "✅ Selector"},
+                {"action": "sniff"},
+                {"protocol": "dns", "action": "hijack-dns"},
+                {"ip_is_private": True, "outbound": "direct"},
+                {"network": "udp", "action": "reject"},
+                {"rule_set": ["geosite-category-ads-all"], "action": "reject"},
+                {"rule_set": ["geosite-ir"], "action": "route", "outbound": "direct"},
+                {"rule_set": ["geoip-ir"], "action": "route", "outbound": "direct"},
+            ],
+            "rule_set": [
+                {
+                    "type": "remote",
+                    "tag": "geosite-category-ads-all",
+                    "format": "binary",
+                    "url": "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-category-ads-all.srs",
+                    "download_detour": "direct",
+                },
+                {
+                    "type": "remote",
+                    "tag": "geosite-ir",
+                    "format": "binary",
+                    "url": "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-ir.srs",
+                    "download_detour": "direct",
+                },
+                {
+                    "type": "remote",
+                    "tag": "geoip-ir",
+                    "format": "binary",
+                    "url": "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-ir.srs",
+                    "download_detour": "direct",
+                },
+            ],
+            "auto_detect_interface": True,
+            "final": "✅ Selector",
+        },
+        "ntp": {
+            "enabled": True,
+            "server": "time.cloudflare.com",
+            "server_port": 123,
+            "interval": "30m",
+            "write_to_system": False,
+        },
+        "experimental": {
+            "cache_file": {"enabled": True, "store_fakeip": True},
+            "clash_api": {
+                "external_controller": "127.0.0.1:9090",
+                "external_ui": "ui",
+                "default_mode": "Rule",
+                "external_ui_download_url": "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
+                "external_ui_download_detour": "direct",
+            },
+        },
+    }
+    return json.dumps(profile, ensure_ascii=False, separators=(",", ":"))
 
 
-def _build_vjson_body(configs: list, allow_insecure: bool = False) -> str:
-    """v2rayN JSON matching worker's buildVJsonProfile."""
+def _build_vjson_body(data: dict, allow_insecure: bool = False) -> str:
+    """v2rayN JSON — identical to the worker's buildVJsonProfile."""
+    uniq = _unique_namer()
     outbounds = []
-    for uri in configs:
-        parts = _sub_node_parts(uri)
-        outbounds.append({
-            "tag": parts.get("remark") or "Spider",
+    for uri in _sub_configs_from_data(data):
+        p = _sub_node_parts(uri)
+        tag = uniq(p.get("remark") or _SUB_BRAND)
+        ob = {
+            "tag": tag,
             "protocol": "vless",
             "settings": {"vnext": [{
-                "address": parts["address"],
-                "port": int(parts["port"]),
-                "users": [{"id": parts["uuid"], "encryption": "none"}],
+                "address": p["address"],
+                "port": int(p["port"]),
+                "users": [{"id": p["uuid"], "encryption": "none"}],
             }]},
             "streamSettings": {
-                "network": parts.get("type") or "ws",
-                "security": "tls" if parts.get("security") == "tls" else "none",
-                "tlsSettings": ({"serverName": parts["sni"], "allowInsecure": bool(allow_insecure), "alpn": ["http/1.1"]}
-                                if parts.get("security") == "tls" else None),
-                "wsSettings": {"path": parts["path"], "headers": {"Host": parts["host"]}},
+                "network": p.get("type") or "ws",
+                "security": "tls" if p.get("security") == "tls" else "none",
+                "wsSettings": {"path": p["path"], "headers": {"Host": p["host"]}},
             },
-        })
-    return json.dumps({"remarks": "SpiderPanel", "outbounds": outbounds}, ensure_ascii=False)
+        }
+        if p.get("security") == "tls":
+            ob["streamSettings"]["tlsSettings"] = {
+                "serverName": p["sni"],
+                "allowInsecure": bool(allow_insecure),
+                "alpn": ["http/1.1"],
+            }
+        outbounds.append(ob)
+    return json.dumps({"remarks": "SpiderPanel", "outbounds": outbounds}, ensure_ascii=False, separators=(",", ":"))
 
 
-_SUB_FORMAT_ALIASES = {
-    "clash": "clash", "yaml": "clash", "meta": "clash", "stash": "clash",
-    "singbox": "singbox", "sing-box": "singbox", "sb": "singbox",
-    "raw": "raw", "v2ray": "raw", "base64": "raw",
-    "vjson": "vjson", "v2rayn": "vjson",
+# ── Error & portal pages (worker serveErrorPage / serveProSubscriptionPage) ──
+def _sub_error_page(code: int) -> str:
+    """Styled HTML error page for browsers (plain text goes to API clients)."""
+    msgs = {
+        404: "This path does not exist or has moved",
+        410: "This link is no longer valid",
+    }
+    msg = msgs.get(code, "Not Found")
+    return (
+        "<!doctype html><html lang=\"en\" dir=\"ltr\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        f"<title>{code} — {_SUB_BRAND}Panel</title><style>"
+        "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
+        "background:radial-gradient(1200px 600px at 80% -10%,#062823,transparent),#000;"
+        "color:#f4f4f5;font-family:-apple-system,Segoe UI,Tahoma,sans-serif}"
+        ".card{text-align:center;padding:40px 26px;border:1px solid #1e1e26;border-radius:20px;background:#0d0d12;max-width:420px}"
+        "h1{font-size:64px;margin:0 0 10px;color:#00e1c1}p{color:#8b8b96;margin:0;font-size:15px}</style></head>"
+        f"<body><div class=\"card\"><h1>{code}</h1><p>{msg}</p></div></body></html>"
+    )
+
+
+_PORTAL_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
 }
-
-
-def _detect_sub_client(ua: str) -> str:
-    ua = (ua or "").lower()
-    if "clash" in ua:
-        return "clash"
-    if "sing-box" in ua or "singbox" in ua:
-        return "singbox"
-    if "shadowrocket" in ua or "quantumult" in ua or "nekobox" in ua:
-        return "raw"
-    return "raw"
-
-
-def _is_browser_ua(ua: str, accept: str) -> bool:
-    low = (ua or "").lower()
-    if "text/html" not in accept:
-        return False
-    if not re.search(r"mozilla|chrome|safari|firefox|edge|opera", low):
-        return False
-    if re.search(r"v2ray|clash|sing-box|hiddify|nekobox|shadowrocket|quantumult|streisand", low):
-        return False
-    return True
-
 
 _SUB_PORTAL_PAGE = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -3302,28 +3783,29 @@ h1{font-size:18px;margin-bottom:4px}.sub{color:var(--muted);font-size:13px;margi
 .stat b{color:var(--accent)}
 .bar{height:8px;background:#1b1b22;border-radius:99px;overflow:hidden;margin:12px 0 6px}
 .bar i{display:block;height:100%;background:linear-gradient(90deg,#00e1c1,#00c9a9);border-radius:99px}
-.link{width:100%;margin-top:16px;padding:12px;background:#08080b;border:1px solid var(--line);border-radius:12px;
-font-family:ui-monospace,monospace;font-size:12px;direction:ltr;text-align:left;color:var(--txt);word-break:break-all}
+.link{width:100%;margin-top:14px;padding:11px;background:#08080b;border:1px solid var(--line);border-radius:12px;
+font-family:ui-monospace,monospace;font-size:11px;direction:ltr;text-align:left;color:var(--txt);word-break:break-all}
+.link small{display:block;color:var(--muted);font-family:inherit;font-size:10px;margin-bottom:4px;direction:rtl;text-align:right}
 .btn{display:block;width:100%;margin-top:10px;padding:12px;border-radius:12px;border:0;background:#14141c;color:var(--txt);
 font-size:14px;cursor:pointer;font-family:inherit}
 .btn.p{background:var(--accent);color:#00261f;font-weight:700}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.hide{display:none}.err{padding:60px 20px;text-align:center}
+.err{padding:60px 20px;text-align:center}
 .err h1{font-size:60px;color:var(--accent)}</style></head><body><div class="card" id="app">
 <div class="brand">SVPN</div><div id="body"><div class="err">لطفاً صبر کنید…</div></div></div>
 <script>
 var HASH=location.pathname.split('/').filter(Boolean).pop();
-var apiUrl='/sub/'+HASH+'/api';
+var apiUrl='/api/subscription/'+HASH;
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-function b64(s){return btoa(unescape(encodeURIComponent(s)))}
-function copy(id){var el=document.getElementById(id);var t=el.value||el.textContent;if(navigator.clipboard){navigator.clipboard.writeText(t).then(function(){flash('کپی شد ✓')})}else{flash('کپی شد ✓')}}
-function flash(m){var d=document.getElementById('toast');d.textContent=m;d.style.opacity=1;setTimeout(function(){d.style.opacity=0},1200)}
+function flash(m){var d=document.getElementById('toast');if(!d)return;d.textContent=m;d.style.opacity=1;setTimeout(function(){d.style.opacity=0},1200)}
+function copy(t){if(navigator.clipboard)navigator.clipboard.writeText(t).then(function(){flash('کپی شد ✓')});else flash('کپی شد ✓')}
 fetch(apiUrl).then(function(r){if(!r.ok)throw new Error(r.status);return r.json()}).then(function(d){
-var used=(d.usage&&d.usage.usedBytes)||0,lim=(d.usage&&d.usage.limitBytes)||0,unlim=!(d.usage&&d.usage.unlimited===false?0:1)||(d.usage&&d.usage.unlimited!==false);
-unlim=unlim&&(!lim||lim<=0);
-var pct=unlim?0:Math.min(100,(used/ (lim||1))*100);
+var used=(d.usage&&d.usage.usedBytes)||0,lim=(d.usage&&d.usage.limitBytes)||0;
+var unlim=!!(d.usage&&d.usage.unlimited);
+var pct=unlim?0:Math.min(100,(used/(lim||1))*100);
 var subU='https://'+location.host+'/sub/'+HASH;
-var totalTxt=unlim?('نامحدود'):(Math.round(lim/1073741824*100)/100+' GB');
+var rawU=subU+'?format=raw',clashU=subU+'?format=clash',singU=subU+'?format=singbox',vjsonU=subU+'?format=vjson';
+var totalTxt=unlim?'نامحدود':(Math.round(lim/1073741824*100)/100+' GB');
 var usedTxt=Math.round(used/1073741824*100)/100+' GB';
 var rem=(d.expiry&&!d.expiry.unlimited)?new Date(d.expiry.ms).toLocaleDateString('fa-IR'):'نامحدود';
 var status=d.status||'active';
@@ -3335,108 +3817,113 @@ rows+='<div class="stat"><span>وضعیت</span><b style="color:'+stColor+'">'+s
 rows+='<div class="stat"><span>مصرف شده</span><b>'+usedTxt+'</b></div>';
 rows+='<div class="stat"><span>حجم کل</span><b>'+totalTxt+'</b></div>';
 rows+='<div class="stat"><span>انقضا</span><b>'+rem+'</b></div>';
-rows+='<div class="bar"><i style="width:'+pct+'%"></i></div><div class="stat"><span>'+(pct.toFixed(0))+'٪ استفاده</span><b>'+(unlim?'':('لینک ساب'))+'</b></div>';
-var links =
-'<div class="link" id="l0" data-s="'+subU+'">'+subU+'</div>';
+rows+='<div class="bar"><i style="width:'+pct+'%"></i></div><div class="stat"><span>'+(pct.toFixed(0))+'٪ استفاده</span><b></b></div>';
+var links='';
+links+='<div class="link"><small>Auto-Detect · Hiddify · v2rayNG · Streisand</small>'+subU+'</div>';
+links+='<div class="link"><small>V2Ray / Universal (Base64)</small>'+rawU+'</div>';
+links+='<div class="link"><small>Clash / Meta / Mihomo</small>'+clashU+'</div>';
+links+='<div class="link"><small>Sing-Box / Hiddify / Karing</small>'+singU+'</div>';
+links+='<div class="link"><small>v2rayN JSON</small>'+vjsonU+'</div>';
 document.getElementById('body').innerHTML=
 '<div id="toast" style="position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:9;background:#0d0d12;border:1px solid #00e1c1;color:#00e1c1;padding:8px 16px;border-radius:99px;font-size:12px;opacity:0;transition:.3s"></div>'+
-rows+'<button class="btn p" onclick="copy(\'l0\')">📋 کپی لینک سابسکریپشن</button>'+
+rows+
+'<button class="btn p" id="c0">📋 کپی لینک سابسکریپشن</button>'+
 '<div class="row">'+
-'<button class="btn" onclick="copyFmt(0)">وارد کردن در Hiddify</button>'+
-'<button class="btn" onclick="copyFmt(1)">وارد کردن در v2rayNG</button>'+
+'<button class="btn" id="i0">وارد کردن در Hiddify</button>'+
+'<button class="btn" id="i1">وارد کردن در v2rayNG</button>'+
 '</div>'+
 '<div class="row">'+
-'<button class="btn" onclick="copyFmt(2)">👑 Clash</button>'+
-'<button class="btn" onclick="copyFmt(3)">📦 Sing-box</button>'+
-'</div>';
-window._fmtHost=location.host;window._fmtHash=HASH;
+'<button class="btn" id="i2">👑 Clash Meta</button>'+
+'<button class="btn" id="i3">📦 Sing-box</button>'+
+'</div>'+links;
+document.getElementById('c0').onclick=function(){copy(subU)};
+document.getElementById('i0').onclick=function(){location.href='hiddify://import/'+rawU};
+document.getElementById('i1').onclick=function(){location.href='v2rayng://install-config?url='+encodeURIComponent(rawU)};
+document.getElementById('i2').onclick=function(){location.href='clash://install-config?url='+encodeURIComponent(clashU)};
+document.getElementById('i3').onclick=function(){copy(singU)};
 }).catch(function(e){
 document.getElementById('body').innerHTML='<div class="err"><h1>404</h1><div>لینک نامعتبر یا منقضی است.</div></div>';
 });
-function copyFmt(i){var map=['','?format=clash','?format=singbox','?format=vjson'];var u='https://'+location.host+'/sub/'+HASH+map[i];
-var deep=[['hiddify://install-sub?url=','&name=SVPN'],['v2rayn://install-sub?url='+u+'&name=SVPN',''],[''],['']];
-var t=deep[i][0]?deep[i][0]+encodeURIComponent(u)+deep[i][1]:u;
-if(navigator.clipboard)navigator.clipboard.writeText(t);copy('l0');flash(['لینک پایه کپی شد','https://'+location.host+'/sub/'+HASH].join(' '))}
 </script></body></html>"""
 
 
+# ── Routes ───────────────────────────────────────────────────────────────────
 @app.get("/sub/{sub_hash}")
 async def worker_sub_route(sub_hash: str, request: Request):
-    """Worker-style subscription endpoint: `/sub/{hash}` with multi-format output."""
+    """`/sub/{hash}` — mirrors the worker's handleHashedSubRoute exactly."""
     accept = (request.headers.get("Accept") or "").lower()
     ua = request.headers.get("User-Agent") or ""
     host = request.headers.get("Host") or get_host()
 
-    if not _SUB_HASH_RE.match(sub_hash or ""):
+    rec = validate_sub_hash(sub_hash)
+    if rec is None or rec.get("revoked"):
+        code = 410 if (rec and rec.get("revoked")) else 404
         if _is_browser_ua(ua, accept):
-            return HTMLResponse(content=_SUB_PORTAL_PAGE.replace('لینک نامعتبر یا منقضی است.', 'لینک نامعتبر.', 1), status_code=404)
-        return Response(content="Invalid or expired subscription link.", status_code=404,
+            return HTMLResponse(content=_sub_error_page(code), status_code=code)
+        msg = "This subscription link is no longer valid." if code == 410 else "Invalid or expired subscription link."
+        return Response(content=msg, status_code=code,
                         headers={"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"})
 
-    config_uuid = _sub_hash_to_uuid(sub_hash)
-    if not config_uuid:
+    config_uuid = rec["config_uuid"]
+    try:
+        sub_data = await _build_subscription_data_by_uuid(config_uuid)
+    except HTTPException:
+        sub_data = None
+    if sub_data is None or not bool(sub_data.get("is_active", True)):
+        # Deleted user (dangling) or not connectable (disabled/expired/over
+        # limit) → the worker returns the same dead-link response (410).
         if _is_browser_ua(ua, accept):
-            return HTMLResponse(content=_SUB_PORTAL_PAGE.replace('لینک نامعتبر یا منقضی است.', 'لینک نامعتبر.', 1), status_code=404)
-        return Response(content="Invalid or expired subscription link.", status_code=404,
+            return HTMLResponse(content=_sub_error_page(410), status_code=410)
+        return Response(content="This subscription link is no longer valid.", status_code=410,
                         headers={"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"})
 
     fmt_param = (request.query_params.get("format") or request.query_params.get("flag") or "").lower()
     forced_flag = _SUB_FORMAT_ALIASES.get(fmt_param)
-    is_browser = _is_browser_ua(ua, accept)
-    wants_portal = request.query_params.get("view") == "1" or (not forced_flag and is_browser)
+    client_type = _detect_sub_client(ua)
+    wants_portal = (request.query_params.get("view") == "1"
+                    or (not forced_flag and client_type == "browser" and "text/html" in accept))
     if wants_portal:
-        return HTMLResponse(content=_SUB_PORTAL_PAGE)
+        return HTMLResponse(content=_SUB_PORTAL_PAGE, headers=_PORTAL_HEADERS)
 
-    client_flag = forced_flag or (_detect_sub_client(ua) if not is_browser else "raw")
-    allow_insecure = any(request.query_params.get(k) in ("true", "1") for k in ("insecure", "allowInsecure", "allow_insecure"))
+    effective_flag = forced_flag or ("clash" if client_type == "clash" else "singbox" if client_type == "singbox" else "raw")
+    allow_insecure = any(request.query_params.get(k) in ("true", "1")
+                         for k in ("insecure", "allowInsecure", "allow_insecure"))
 
-    try:
-        sub_data = await _build_subscription_data_by_uuid(config_uuid)
-    except HTTPException:
-        if is_browser:
-            return HTMLResponse(content=_SUB_PORTAL_PAGE.replace('لینک نامعتبر یا منقضی است.', 'لینک نامعتبر.', 1), status_code=404)
-        return Response(content="Invalid or expired subscription link.", status_code=404,
-                        headers={"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"})
-
-    configs = _sub_configs_from_data(sub_data)
-    if not configs:
-        return Response(content="Invalid or expired subscription link.", status_code=404,
-                        headers={"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"})
-
-    if client_flag == "clash":
-        body = _build_clash_yaml_body(configs, allow_insecure)
-        ctype = "text/yaml; charset=utf-8"
-    elif client_flag == "singbox":
-        body = _build_singbox_body(configs, allow_insecure)
-        ctype = "application/json; charset=utf-8"
-    elif client_flag == "vjson":
-        body = _build_vjson_body(configs, allow_insecure)
-        ctype = "application/json; charset=utf-8"
+    cache_key = f"{effective_flag}|{host}|{config_uuid}|{1 if allow_insecure else 0}"
+    cached = _config_cache_get(cache_key)
+    if cached is not None:
+        body, ctype = cached
     else:
-        raw_text = _build_sub_uri_text(configs)
-        body = raw_text if request.query_params.get("raw") else base64.b64encode(raw_text.encode()).decode()
-        ctype = "text/plain; charset=utf-8"
+        if effective_flag == "clash":
+            body = _build_clash_yaml_body(sub_data, allow_insecure)
+            ctype = "text/yaml; charset=utf-8"
+        elif effective_flag == "singbox":
+            body = _build_singbox_body(sub_data, allow_insecure)
+            ctype = "application/json; charset=utf-8"
+        elif effective_flag == "vjson":
+            body = _build_vjson_body(sub_data, allow_insecure)
+            ctype = "application/json; charset=utf-8"
+        else:
+            raw_text = _build_sub_uri_text(_sub_configs_from_data(sub_data))
+            body = base64.b64encode(raw_text.encode("utf-8")).decode("ascii")
+            ctype = "text/plain; charset=utf-8"
+        _config_cache_put(cache_key, (body, ctype))
 
-    out = Response(content=body, media_type=ctype, headers={
-        "Cache-Control": "no-store, no-cache, must-revalidate",
-        "Access-Control-Allow-Origin": "*",
-        "Pragma": "no-cache",
-        "profile-update-interval": "1",
-        "profile-web-page-url": f"https://{host}/sub/{sub_hash}",
-    })
     name = str(sub_data.get("username") or config_uuid)
     used = max(0, int(sub_data.get("traffic_used_bytes") or 0))
     limit = max(0, int(sub_data.get("traffic_limit_bytes") or 0))
-    expire_ts = 0
-    try:
-        uid, user = await _find_user_by_config_uuid(config_uuid)
-        if user and user.get("expire_at"):
-            expire_ts = int(datetime.fromisoformat(str(user["expire_at"])).timestamp())
-    except Exception:
-        pass
-    size_txt = "Unlimited" if limit <= 0 else f"{int(limit / 1024 ** 3)}GB"
-    title_b64 = "base64:" + base64.b64encode(quote(f"{name} · {size_txt}").encode()).decode()
+    expire_ts = int(sub_data.get("expire_at_ts") or 0)
     userinfo = f"upload=0; download={used}; total={limit}; expire={expire_ts}"
+    size_txt = "Unlimited" if limit <= 0 else f"{int(limit / 1073741824)}GB"
+    title_b64 = "base64:" + base64.b64encode(f"{name} · {size_txt}".encode("utf-8")).decode("ascii")
+
+    out = Response(content=body, status_code=200)
+    out.headers["Content-Type"] = ctype
+    out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+    out.headers["Access-Control-Allow-Origin"] = "*"
+    out.headers["Pragma"] = "no-cache"
+    out.headers["profile-update-interval"] = "1"
+    out.headers["profile-web-page-url"] = f"https://{host}/sub/{sub_hash}"
     out.headers["subscription-userinfo"] = userinfo
     out.headers["x-subscription-userinfo"] = userinfo
     out.headers["profile-title"] = title_b64
@@ -3444,54 +3931,103 @@ async def worker_sub_route(sub_hash: str, request: Request):
     return out
 
 
-@app.get("/sub/{sub_hash}/api")
-async def worker_sub_api(sub_hash: str, request: Request):
-    """Worker-style subscription info API: `/sub/{hash}/api` (mirrors handleSubscriptionApi)."""
-    cors = {"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"}
-    if request.method == "POST":
-        return JSONResponse({"ok": False, "error": "invalid_reward_action"}, status_code=400, headers=cors)
-    if not _SUB_HASH_RE.match(sub_hash or ""):
-        return JSONResponse({"ok": False, "error": "invalid_hash"}, status_code=404, headers=cors)
-    config_uuid = _sub_hash_to_uuid(sub_hash)
-    if not config_uuid:
-        return JSONResponse({"ok": False, "error": "invalid_hash"}, status_code=404, headers=cors)
+_SUB_API_CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Cache-Control": "no-store",
+}
+
+
+async def _subscription_api_handler(sub_hash: str, request: Request):
+    """Mirrors the worker's handleSubscriptionApi (`/api/subscription/{hash}`)."""
+    cors = dict(_SUB_API_CORS)
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=cors)
+    if request.method not in ("GET", "POST", "HEAD"):
+        return Response(content="405", status_code=405, headers=cors)
+
+    rec = validate_sub_hash(sub_hash)
+    if rec is None:
+        return JSONResponse(content={"ok": False, "error": "invalid_hash"}, status_code=404, headers=cors)
+    if rec.get("revoked"):
+        return JSONResponse(content={"ok": False, "error": "revoked_hash"}, status_code=410, headers=cors)
+    config_uuid = rec["config_uuid"]
     try:
         data = await _build_subscription_data_by_uuid(config_uuid)
     except HTTPException:
-        return JSONResponse({"ok": False, "error": "user_deleted"}, status_code=404, headers=cors)
-    used = int(data.get("traffic_used_bytes") or 0)
-    limit = int(data.get("traffic_limit_bytes") or 0)
+        return JSONResponse(content={"ok": False, "error": "user_deleted"}, status_code=404, headers=cors)
+    if not bool(data.get("is_active", True)):
+        # disabled / expired / over-limit users mirror the worker's `revoked` state
+        return JSONResponse(content={"ok": False, "error": "revoked_hash"}, status_code=410, headers=cors)
+
+    if request.method == "POST":
+        try:
+            raw_body = await request.body()
+        except Exception:
+            raw_body = b""
+        if not raw_body or len(raw_body) > 32 * 1024:
+            return JSONResponse(content={"ok": False, "error": "invalid_json"}, status_code=400, headers=cors)
+        try:
+            body2 = json.loads(raw_body)
+        except Exception:
+            return JSONResponse(content={"ok": False, "error": "invalid_json"}, status_code=400, headers=cors)
+        if not isinstance(body2, dict) or body2.get("action") != "redeem":
+            return JSONResponse(content={"ok": False, "error": "invalid_reward_action"}, status_code=400, headers=cors)
+        # SpiderPanel has no reward/telegram-owner layer — mirror the worker's
+        # response for an account with no linked Telegram owner.
+        return JSONResponse(content={"ok": False, "error": "telegram_account_not_linked"}, status_code=403, headers=cors)
+
+    now_ms = int(time.time() * 1000)
+    used = max(0, int(data.get("traffic_used_bytes") or 0))
+    limit = max(0, int(data.get("traffic_limit_bytes") or 0))
     unlimited = limit <= 0
-    expire_ms = 0
-    try:
-        uid, user = await _find_user_by_config_uuid(config_uuid)
-        if user and user.get("expire_at"):
-            expire_ms = int(datetime.fromisoformat(str(user["expire_at"])).timestamp() * 1000)
-    except Exception:
-        pass
-    if expire_ms and expire_ms < time.time() * 1000:
+    expire_ts = int(data.get("expire_at_ts") or 0)
+    expire_ms = expire_ts * 1000 if expire_ts else 0
+    st_raw = str(data.get("status") or "active").lower()
+    if st_raw == "disabled":
+        status = "paused"
+    elif expire_ms and expire_ms < now_ms:
         status = "expired"
-    elif user and not data.get("is_active", True):
-        status = "paused" if data.get("status") == "disabled" else "expired"
+    elif not unlimited and limit > 0 and used >= limit:
+        status = "expired"
     else:
         status = "active"
     body = {
         "ok": True,
         "version": _WORKER_SUB_VERSION,
         "user": {"id": config_uuid, "name": data.get("username") or config_uuid},
-        "sub": config_uuid,
+        "sub": rec.get("sub") or "",
         "usage": {
             "usedBytes": used,
             "limitBytes": limit,
             "unlimited": unlimited,
-            "percent": 0 if unlimited else min(100.0, used / max(limit, 1) * 100 if limit > 0 else 0),
+            "percent": 0 if unlimited else min(100.0, (used / limit * 100) if limit > 0 else 0),
         },
-        "expiry": {"ms": expire_ms, "remainingMs": max(0, expire_ms - int(time.time() * 1000)) if expire_ms else 0, "unlimited": not expire_ms},
+        "expiry": {
+            "ms": expire_ms,
+            "remainingMs": max(0, expire_ms - now_ms) if expire_ms else 0,
+            "unlimited": not expire_ms,
+        },
         "status": status,
-        "issuedAt": None,
-        "serverTime": int(time.time() * 1000),
+        "issuedAt": rec.get("issuedAt") or None,
+        "serverTime": now_ms,
     }
     return JSONResponse(content=body, headers=cors)
+
+
+@app.api_route("/api/subscription/{sub_hash}", methods=["GET", "POST", "OPTIONS", "PUT", "DELETE", "PATCH"])
+async def api_subscription_route(sub_hash: str, request: Request):
+    """Canonical worker-style status API: `/api/subscription/{hash}`."""
+    return await _subscription_api_handler(sub_hash, request)
+
+
+@app.api_route("/sub/{sub_hash}/api", methods=["GET", "POST", "OPTIONS", "PUT", "DELETE", "PATCH"])
+async def legacy_sub_api_route(sub_hash: str, request: Request):
+    """Legacy alias kept for older portal bookmarks (`/sub/{hash}/api`)."""
+    return await _subscription_api_handler(sub_hash, request)
+
+
 
 # ── Auth endpoints ────────────────────────────────────────────────────────────
 @app.post("/api/login")
