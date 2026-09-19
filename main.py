@@ -3530,9 +3530,9 @@ def _sub_error_page(code: int) -> str:
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         f"<title>{code} — {_SUB_BRAND}Panel</title><style>"
         "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
-        "background:radial-gradient(1200px 600px at 80% -10%,#062823,transparent),#000;"
+        "background:radial-gradient(1200px 600px at 80% -10%,#062823,transparent),#101013;"
         "color:#f4f4f5;font-family:-apple-system,Segoe UI,Tahoma,sans-serif}"
-        ".card{text-align:center;padding:40px 26px;border:1px solid #1e1e26;border-radius:20px;background:#0d0d12;max-width:420px}"
+        ".card{text-align:center;padding:40px 26px;border:1px solid #2b2b33;border-radius:20px;background:#16161b;max-width:420px}"
         "h1{font-size:64px;margin:0 0 10px;color:#00e1c1}p{color:#8b8b96;margin:0;font-size:15px}</style></head>"
         f"<body><div class=\"card\"><h1>{code}</h1><p>{msg}</p></div></body></html>"
     )
@@ -3735,13 +3735,50 @@ async def legacy_sub_api_route(sub_hash: str, request: Request):
 
 
 # ── Auth endpoints ────────────────────────────────────────────────────────────
+_LOGIN_FAILS = {}
+_LOGIN_FAILS_LOCK = asyncio.Lock()
+_LOGIN_MAX_FAILS = 8
+_LOGIN_FAIL_WINDOW = 300.0  # 5 minutes
+
+
+async def _login_rate_allowed(ip: str) -> bool:
+    async with _LOGIN_FAILS_LOCK:
+        now = time.time()
+        arr = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < _LOGIN_FAIL_WINDOW]
+        if len(arr) >= _LOGIN_MAX_FAILS:
+            _LOGIN_FAILS[ip] = arr
+            return False
+        return True
+
+
+async def _login_record_fail(ip: str) -> None:
+    async with _LOGIN_FAILS_LOCK:
+        now = time.time()
+        arr = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < _LOGIN_FAIL_WINDOW]
+        arr.append(now)
+        _LOGIN_FAILS[ip] = arr
+        if len(_LOGIN_FAILS) > 512:
+            for k in [k for k, v in _LOGIN_FAILS.items() if not v or now - v[-1] > _LOGIN_FAIL_WINDOW]:
+                _LOGIN_FAILS.pop(k, None)
+
+
+async def _login_clear(ip: str) -> None:
+    async with _LOGIN_FAILS_LOCK:
+        _LOGIN_FAILS.pop(ip, None)
+
+
 @app.post("/api/login")
 async def api_login(request: Request):
     body = await request.json()
     ip = client_ip(request)
+    if not await _login_rate_allowed(ip):
+        raise HTTPException(status_code=429,
+                            detail="تلاش‌های بیش از حد مجاز؛ چند دقیقه دیگر دوباره امتحان کنید")
     if hash_password(str(body.get("password", ""))) != AUTH["password_hash"]:
+        await _login_record_fail(ip)
         log_activity("auth", f"تلاش ورود ناموفق از {ip}", "err")
         raise HTTPException(status_code=401, detail="رمز عبور اشتباه است")
+    await _login_clear(ip)
     token = await create_session()
     log_activity("auth", f"ورود موفق به پنل از {ip}", "ok")
     resp = JSONResponse({"ok": True})
@@ -9855,10 +9892,10 @@ _NOT_FOUND_PAGE = """<!doctype html>
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
 background:radial-gradient(900px 500px at 85% -10%,rgba(0,225,193,.09),transparent 60%),
-radial-gradient(700px 420px at 8% 110%,rgba(0,225,193,.06),transparent 60%),#050507;
+radial-gradient(700px 420px at 8% 110%,rgba(0,225,193,.06),transparent 60%),#101013;
 color:#f4f4f5;font-family:Vazirmatn,-apple-system,'Segoe UI',Tahoma,sans-serif}
-.card{text-align:center;max-width:430px;width:100%;border:1px solid #1c1c24;border-radius:24px;
-background:rgba(13,13,18,.85);backdrop-filter:blur(10px);padding:44px 30px 38px;
+.card{text-align:center;max-width:430px;width:100%;border:1px solid #2b2b33;border-radius:24px;
+background:rgba(26,26,32,.9);backdrop-filter:blur(10px);padding:44px 30px 38px;
 box-shadow:0 30px 80px rgba(0,0,0,.55)}
 .spider{width:88px;height:88px;margin:0 auto 6px;display:block;color:#00e1c1;
 filter:drop-shadow(0 0 18px rgba(0,225,193,.35))}

@@ -9,7 +9,7 @@
 /* ── CDN-independent fallback: page stays pixel-perfect even if Tailwind/fonts CDN are blocked (Iran filtering) ── */
 *,*::before,*::after{box-sizing:border-box}
 html,body{margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#050505;color:#fff;min-height:100vh}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#0f0f12;color:#fff;min-height:100vh}
 .h-screen{height:100vh}.w-screen{width:100vw}.relative{position:relative}.absolute{position:absolute}
 .flex{display:flex}.flex-col{flex-direction:column}.items-center{align-items:center}.justify-center{justify-content:center}
 .overflow-hidden{overflow:hidden}.text-center{text-align:center}.mx-4{margin-left:1rem;margin-right:1rem}
@@ -28,7 +28,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 input.input-glass{width:100%;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);border-radius:.9rem;color:#fff;font-size:.95rem;outline:none;transition:border .2s, box-shadow .2s}
 input.input-glass::placeholder{color:#6b7280}
 input.input-glass:focus{border-color:rgba(255,255,255,.4);box-shadow:0 0 0 4px rgba(255,255,255,.06)}
-.glass-card{background:rgba(16,16,20,.86);border:1px solid rgba(255,255,255,.09);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+.glass-card{background:rgba(26,26,31,.88);border:1px solid rgba(255,255,255,.09);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
 button.btn-submit{width:100%;background:#fff;color:#000;border:0;border-radius:.9rem;font-weight:700;font-size:.95rem;cursor:pointer;transition:opacity .2s}
 button.btn-submit:hover{opacity:.88}
 button.btn-submit:disabled{opacity:.55;cursor:wait}
@@ -60,7 +60,7 @@ tailwind.config = {
             colors: {
                 "on-surface": "#e2e2e2",
                 "on-surface-variant": "#94a3b8",
-                "background": "#000000"
+                "background": "#0f0f12"
             },
             fontFamily: {
                 "headline-lg": ["Inter"],
@@ -106,7 +106,7 @@ input, textarea, select {
 }
 
 body {
-    background-color: #000000 !important;
+    background-color: #0f0f12 !important;
     color: #e2e2e2 !important;
     min-height: 100vh;
     width: 100vw;
@@ -350,11 +350,23 @@ document.getElementById('login-form').addEventListener('submit', async function(
     btnSpinner.classList.remove('hidden');
 
     try {
-        var r = await fetch('/api/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ password: document.getElementById('password').value })
-        });
+        var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        var timer = ctrl ? setTimeout(function(){ ctrl.abort(); }, 12000) : null;
+        var r;
+        try {
+            r = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: document.getElementById('password').value }),
+                signal: ctrl ? ctrl.signal : undefined
+            });
+        } catch (fetchEx) {
+            if (timer) clearTimeout(timer);
+            throw new Error(fetchEx && fetchEx.name === 'AbortError'
+                ? 'پاسخی از سرور دریافت نشد (تایم‌اوت)'
+                : 'ارتباط با سرور برقرار نشد');
+        }
+        if (timer) clearTimeout(timer);
         if (!r.ok) {
             var d = await r.json().catch(function() { return {}; });
             throw new Error(d.detail || 'Login failed');
