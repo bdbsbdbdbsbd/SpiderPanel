@@ -1378,6 +1378,12 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
             </div>
           </div>
           <div class="settings-inner-block">
+            <div class="panel-h"><span class="glow" data-i18n="dbSrv">اتصال به سرور داده</span></div>
+            <div class="px-hint" data-i18n="dbSrvHint"></div>
+            <div id="db-info-box" dir="ltr" style="margin-top:10px;padding:10px 12px;border-radius:10px;background:var(--input-bg);font-size:12px;line-height:2;color:var(--txt2);font-family:monospace;overflow-x:auto"></div>
+            <button class="btn btn-r" style="width:100%;margin-top:10px" onclick="unlinkDatabase()"><span data-i18n="dbUnlink">قطع اتصال دیتابیس</span></button>
+          </div>
+          <div class="settings-inner-block">
             <div class="panel-h"><span class="glow" data-i18n="panelUpdate">بروزرسانی پنل</span></div>
             <div class="px-hint" data-i18n="panelUpdateHint">با زدن این دکمه، آخرین نسخه پنل از منبع رسمی دریافت و روی سرور نصب می‌شود. بعد از اتمام، پنل را ری‌استارت/ری‌دپلوی کنید تا نسخه جدید اعمال شود.</div>
             <button class="btn btn-p" style="width:100%;margin-top:10px" id="upd-btn" onclick="runPanelUpdate()"><span data-i18n="updatePanel">بروزرسانی</span></button>
@@ -1655,6 +1661,12 @@ var I18N = {
     'adminPathBtn': 'ذخیره مسیر',
     'adminPathReset': 'بازگشت به پیش‌فرض',
     'subLinkCopied': 'لینک ساب کپی شد',
+    'dbSrv': 'اتصال به سرور داده',
+    'dbSrvHint': 'همه اطلاعات پنل (کاربران، تنظیمات، لینک‌ها و ساب‌ها) در دیتابیس MySQL سرور داده ذخیره می‌شود. با قطع اتصال، پنل قفل می‌شود تا دوباره دیتابیس را وارد کنید.',
+    'dbUnlink': 'قطع اتصال دیتابیس',
+    'dbUnlinkConfirm': 'اتصال به سرور داده قطع شود؟ پنل قفل می‌شود و تا وارد کردن دیتابیس کار نمی‌کند.',
+    'dbConnected': 'متصل',
+    'dbDisconnected': 'قطع',
     'acAutoBtn': 'Auto', 'acHint': 'اسکن کامل خودکار: پینگ دامنه‌ها → انتخاب Railway/Cloudflare → اسکن IP → تست دامنه‌های TCP → اسکن SNI → پینگ نهایی پنل. همه مراحل با اینترنت خود شما انجام می‌شود.',
     'acEnterDomain': 'لطفاً دامنه پنل را وارد کنید', 'acPingingDomains': 'در حال گرفتن پینگ از دامنه‌ها...', 'acYourDomain': 'دامنه شما', 'acPickDomain': 'دامنه را انتخاب کنید (دامنه Railway → اسکن IP های Railway، غیر از آن → اسکن IP های Cloudflare):',
     'acScanningRailway': 'اسکن IP های Railway و ذخیره ۱۰ تای برتر...', 'acScanningCf': 'اسکن IP های Cloudflare و ذخیره ۱۰ تای برتر...',
@@ -1715,6 +1727,12 @@ var I18N = {
     'adminPathBtn': 'Save Path',
     'adminPathReset': 'Reset to Default',
     'subLinkCopied': 'Subscription link copied',
+    'dbSrv': 'Data Server Connection',
+    'dbSrvHint': 'All panel data (users, settings, links, subs) is stored in the external MySQL data server. Disconnecting locks the panel until a database is entered again.',
+    'dbUnlink': 'Disconnect Database',
+    'dbUnlinkConfirm': 'Disconnect from the data server? The panel locks until you enter a database again.',
+    'dbConnected': 'Connected',
+    'dbDisconnected': 'Disconnected',
     'acAutoBtn': 'Auto', 'acHint': 'Full automatic scan: ping domains → pick Railway/Cloudflare → IP scan → TCP domain test → SNI scan → final panel ping. All steps run from your own internet.',
     'acEnterDomain': 'Please enter the panel domain', 'acPingingDomains': 'Pinging domains...', 'acYourDomain': 'Your domain', 'acPickDomain': 'Pick a domain (Railway → scan Railway IPs, otherwise → scan Cloudflare IPs):',
     'acScanningRailway': 'Scanning Railway IPs, saving top 10...', 'acScanningCf': 'Scanning Cloudflare IPs, saving top 10...',
@@ -2036,7 +2054,7 @@ function switchTab(tab, el) {
   target.style.setProperty('margin-top', '0px', 'important');
   target.style.setProperty('top', '0px', 'important');
   target.style.setProperty('transform', 'none', 'important');
-  if (tab === 'settings') loadAdminPath();
+  if (tab === 'settings') { loadAdminPath(); loadDbInfo(); }
   if (tab === 'settings' || tab === 'nodes') {
     target.style.setProperty('position', 'static', 'important');
     target.style.setProperty('flex', 'none', 'important');
@@ -2847,6 +2865,30 @@ async function deleteInbound(iid) {
 // ─── Settings ───
 function loadSettings() {
   // Already handled by theme pickers in HTML
+}
+
+// ─── External data server ───
+async function loadDbInfo() {
+  var box = $id('db-info-box');
+  if (!box) return;
+  try {
+    var d = await api('/api/db-info');
+    var st = d.connected ? ('\u2713 ' + t('dbConnected')) : ('\u2717 ' + t('dbDisconnected'));
+    box.textContent = 'database: ' + (d.database || '\u2014') + '\n' +
+                      'server: ' + (d.url || '\u2014') + '\n' +
+                      'status: ' + st + (d.last_sync ? ('\nlast sync: ' + d.last_sync) : '');
+    box.style.color = d.connected ? 'var(--txt2)' : 'var(--red)';
+  } catch (e) {
+    box.textContent = '\u2717 ' + (e.message || 'database');
+    box.style.color = 'var(--red)';
+  }
+}
+async function unlinkDatabase() {
+  if (!confirm(t('dbUnlinkConfirm'))) return;
+  try {
+    await api('/api/db-unlink', { method: 'POST' });
+    window.location.reload();
+  } catch (e) { toast(e.message, 'err'); setTimeout(function(){ window.location.reload(); }, 1200); }
 }
 
 // ─── Admin login path ───

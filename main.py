@@ -460,8 +460,11 @@ async def _save_state_now():
             async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
                 await f.write(json.dumps(data, ensure_ascii=False, indent=2))
             tmp.replace(DATA_FILE)
+            _db_schedule_push(json.dumps(data, ensure_ascii=False))
+            return data
         except Exception as e:
             logger.warning(f"Could not save state: {e}")
+            return None
 
 # ── In-memory state ───────────────────────────────────────────────────────────
 connections: dict = {}
@@ -657,6 +660,8 @@ async def destroy_session(token: str | None):
         SESSIONS.pop(token, None)
 
 async def require_auth(request: Request):
+    if DB_GATE["active"]:
+        raise HTTPException(status_code=503, detail="database_required")
     token = request.cookies.get(SESSION_COOKIE)
     if not await is_valid_session(token):
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -959,6 +964,394 @@ async def _ensure_xray() -> bool:
 
 
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXTERNAL DATA SERVER (MySQL via data-server-manager)
+# ──────────────────────────────────────────────────────────────────────────────
+# Without a configured data server the panel stays locked on the setup page:
+# no login, no API, no Xray, no bot. Once connected, every state change is
+# mirrored to the external MySQL database through the manager's HTTP API.
+# ══════════════════════════════════════════════════════════════════════════════
+
+DB_BOOT_FILE = DATA_DIR / "db_config.json"
+REMOTE_STATE_KEY = "spider_state"
+DEFAULT_DATA_SERVER_PORT = 8200
+
+DB_GATE: dict = {
+    "active": True,          # True → panel locked (setup page only)
+    "configured": False,
+    "url": "",
+    "database": "",
+    "connected": False,
+    "error": "",
+    "last_sync": "",
+    "gate_base": "/spider",  # admin base while locked (from local cache)
+}
+_db_http: httpx.AsyncClient | None = None
+_db_push_lock = asyncio.Lock()
+_db_push_pending: str | None = None
+
+
+class _DbError(Exception):
+    """Persian, user-safe data-server error."""
+
+
+def _db_boot_load() -> dict | None:
+    try:
+        with open(DB_BOOT_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+        if cfg.get("url") and cfg.get("database") and cfg.get("api_key"):
+            return cfg
+    except Exception:
+        pass
+    return None
+
+
+def _db_boot_save(url: str, database: str, api_key: str) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = DB_BOOT_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"url": url, "database": database, "api_key": api_key},
+                              ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(DB_BOOT_FILE)
+
+
+def _db_boot_clear() -> None:
+    try:
+        DB_BOOT_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _db_parse_server(raw: str) -> str:
+    """Accept 1.2.3.4, host:port, or http(s)://host[:port] → normalized URL."""
+    s = str(raw or "").strip()
+    if not s:
+        raise _DbError("آی‌پی سرور داده را وارد کنید")
+    scheme = ""
+    if "://" in s:
+        scheme, s = s.split("://", 1)
+        if scheme not in ("http", "https"):
+            raise _DbError("آدرس سرور داده باید http یا https باشد")
+    s = s.rstrip("/")
+    if "/" in s or "@" in s:
+        raise _DbError("آدرس سرور داده معتبر نیست")
+    if ":" in s:
+        host, _, port_s = s.rpartition(":")
+        if not host or not port_s.isdigit() or not (1 <= int(port_s) <= 65535):
+            raise _DbError("پورت سرور داده معتبر نیست")
+    else:
+        host, port_s = s, str(DEFAULT_DATA_SERVER_PORT)
+    if not host or len(host) > 253 or any(len(_) == 0 for _ in host.split(".")):
+        raise _DbError("آی‌پی سرور داده معتبر نیست")
+    prefix = (scheme + "://") if scheme else "http://"
+    return prefix + host + ":" + port_s
+
+
+def _db_client() -> httpx.AsyncClient:
+    global _db_http
+    if _db_http is None or _db_http.is_closed:
+        _db_http = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
+    return _db_http
+
+
+async def _db_call(url: str, path: str, api_key: str, payload: dict) -> dict:
+    try:
+        r = await _db_client().post(
+            url.rstrip("/") + path, json=payload,
+            headers={"X-API-Key": api_key, "Content-Type": "application/json"})
+    except httpx.TimeoutException:
+        raise _DbError("سرور داده پاسخ نداد (تایم‌اوت)")
+    except Exception:
+        raise _DbError("اتصال به سرور داده برقرار نشد؛ آی‌پی/پورت را چک کنید")
+    try:
+        data = r.json()
+    except Exception:
+        raise _DbError(f"پاسخ نامعتبر از سرور داده (HTTP {r.status_code})")
+    if r.status_code == 200 and data.get("ok"):
+        return data
+    code = str(data.get("error") or "")
+    if r.status_code == 401 or code == "unauthorized":
+        raise _DbError("API key برای این دیتابیس اشتباه است")
+    if r.status_code == 404 or code in ("unknown_database",):
+        raise _DbError("این دیتابیس روی سرور داده ثبت نشده است (database.yml را چک کنید)")
+    if code == "mysql_unavailable":
+        raise _DbError("سرور داده به MySQL وصل نیست")
+    raise _DbError(str(data.get("detail") or f"خطای سرور داده (HTTP {r.status_code})"))
+
+
+async def _db_ping(url: str, database: str, api_key: str) -> dict:
+    return await _db_call(url, "/api/ping", api_key, {"database": database})
+
+
+async def _db_set(url: str, database: str, api_key: str, key: str, value: str) -> None:
+    await _db_call(url, "/api/set", api_key, {"database": database, "key": key, "value": value})
+
+
+async def _db_get(url: str, database: str, api_key: str, key: str) -> str | None:
+    out = await _db_call(url, "/api/get", api_key, {"database": database, "key": key})
+    return out.get("value") if out.get("found") else None
+
+
+def _gate_base_from_cache() -> str:
+    """Admin base while locked — read from the local cache (emergency mode)."""
+    try:
+        with open(DATA_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        p = _validate_admin_path((data.get("settings") or {}).get("admin_path") or "")
+        if p:
+            return p
+    except Exception:
+        pass
+    return "/spider"
+
+
+def _reset_state_memory() -> None:
+    """Clear every in-memory state container before re-loading from remote."""
+    for d in (LINKS, SUBS, USERS, SETTINGS, GROUPS, INBOUNDS, NODES,
+              PENDING_NODE_DELETIONS, SUB_HASH_INDEX, SUB_HASH_RECORDS,
+              CURRENT_SUB_HASH):
+        d.clear()
+    IP_POOL.clear()
+    IP_BLACKLIST.clear()
+    SUB_HASH_REVOKED.clear()
+
+
+async def _database_gate_boot() -> None:
+    """Startup: connect to the configured data server and pull all state."""
+    boot = _db_boot_load()
+    DB_GATE["gate_base"] = _gate_base_from_cache()
+    if not boot:
+        DB_GATE.update(active=True, configured=False, connected=False, error="")
+        logger.warning("No data server configured — panel is LOCKED until a database is set up")
+        return
+    DB_GATE.update(configured=True, url=boot["url"], database=boot["database"])
+    try:
+        await _db_ping(boot["url"], boot["database"], boot["api_key"])
+        raw = await _db_get(boot["url"], boot["database"], boot["api_key"], REMOTE_STATE_KEY)
+        if raw:
+            data = json.loads(raw)
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = DATA_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(DATA_FILE)
+            _reset_state_memory()
+            await load_state()
+            logger.info("State pulled from data server (%d bytes)", len(raw))
+        DB_GATE.update(active=False, connected=True, error="")
+        if not raw:
+            # Fresh remote database → adopt the local cache as the initial state.
+            await _save_state_now()
+    except _DbError as exc:
+        DB_GATE.update(active=True, connected=False, error=str(exc))
+        logger.warning("Data server unreachable at boot — panel LOCKED: %s", exc)
+    except Exception as exc:
+        DB_GATE.update(active=True, connected=False, error="دیتای سرور داده قابل خواندن نیست")
+        logger.warning("Data server state invalid — panel LOCKED: %s", exc)
+
+
+def _db_schedule_push(payload: str) -> None:
+    global _db_push_pending
+    if DB_GATE["active"] or not DB_GATE["configured"]:
+        return
+    _db_push_pending = payload
+    if not _db_push_lock.locked():
+        asyncio.create_task(_db_push_worker())
+
+
+async def _db_push_worker() -> None:
+    global _db_push_pending
+    async with _db_push_lock:
+        while _db_push_pending is not None:
+            payload, _db_push_pending = _db_push_pending, None
+            try:
+                await _db_set(DB_GATE["url"], DB_GATE["database"],
+                              (_db_boot_load() or {}).get("api_key", ""),
+                              REMOTE_STATE_KEY, payload)
+                DB_GATE.update(connected=True, error="",
+                               last_sync=datetime.now().strftime("%H:%M:%S"))
+            except Exception as exc:
+                DB_GATE.update(connected=False, error=str(exc))
+                logger.warning("Data-server push failed: %s", exc)
+                return  # next save retries
+
+
+_DB_SETUP_PAGE = """<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>اتصال به سرور داده — Spider Panel</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box;margin:0;padding:0}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
+background:radial-gradient(900px 500px at 85% -10%,rgba(0,225,193,.08),transparent 60%),#101013;
+color:#f4f4f5;font-family:Vazirmatn,-apple-system,'Segoe UI',Tahoma,sans-serif}
+.card{width:100%;max-width:460px;border:1px solid #2b2b33;border-radius:22px;background:#151519;
+padding:36px 30px;box-shadow:0 30px 80px rgba(0,0,0,.45)}
+.logo{text-align:center;font-size:26px;font-weight:800;letter-spacing:.35em;color:#fff}
+.logo small{display:block;font-size:10px;letter-spacing:.6em;color:#8b8b96;margin-top:6px}
+h1{font-size:16px;margin:26px 0 4px;text-align:center}
+.sub{font-size:12.5px;color:#9a9aa5;text-align:center;line-height:2;margin-bottom:22px}
+.f{margin-bottom:14px}
+label{display:block;font-size:12px;font-weight:700;color:#c9c9ce;margin-bottom:6px}
+input{width:100%;background:#1d1d22;border:1px solid #313136;border-radius:11px;color:#fff;
+padding:11px 13px;font-size:14px;outline:none;direction:ltr;text-align:left;font-family:inherit}
+input:focus{border-color:#00e1c1}
+.err{display:none;background:rgba(255,80,90,.1);border:1px solid rgba(255,80,90,.35);color:#ff9aa2;
+border-radius:11px;padding:10px 13px;font-size:12.5px;line-height:1.9;margin-bottom:14px}
+button{width:100%;border:0;cursor:pointer;background:#00e1c1;color:#04110e;font-weight:800;
+font-size:14.5px;padding:13px;border-radius:12px;font-family:inherit;transition:filter .2s}
+button:hover{filter:brightness(1.08)}
+button:disabled{filter:grayscale(.4);cursor:wait}
+.hint{margin-top:18px;font-size:11px;color:#6b6b76;line-height:2;text-align:center}
+.hint code{direction:ltr;display:inline-block;background:#1d1d22;padding:1px 7px;border-radius:6px}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">SPIDER<small>PANEL</small></div>
+  <h1>اتصال به سرور داده</h1>
+  <p class="sub">این پنل بدون دیتابیس خارجی کار نمی‌کند.<br>اطلاعات اتصال را از فایل <code>database.yml</code> سرور داده بگیرید.</p>
+  <div class="err" id="err"></div>
+  <form onsubmit="connect(event)">
+    <div class="f">
+      <label>database? (نام دیتابیس)</label>
+      <input id="database" placeholder="database1" autocomplete="off" required>
+    </div>
+    <div class="f">
+      <label>ipserver: (آی‌پی یا آی‌پی:پورت سرور داده)</label>
+      <input id="ipserver" placeholder="51.20.10.5:8200" autocomplete="off" required>
+    </div>
+    <div class="f">
+      <label>apikey:</label>
+      <input id="apikey" placeholder="64 کاراکتر hex" autocomplete="off" required>
+    </div>
+    <button id="btn" type="submit">اتصال و راه‌اندازی</button>
+  </form>
+  <p class="hint">همه اطلاعات پنل (کاربران، تنظیمات، لینک‌ها) در MySQL سرور داده ذخیره می‌شود.</p>
+</div>
+<script>
+async function connect(ev){
+  ev.preventDefault();
+  var err=document.getElementById('err'), btn=document.getElementById('btn');
+  err.style.display='none'; btn.disabled=true; btn.textContent='در حال اتصال...';
+  try{
+    var r=await fetch('/api/db-setup',{method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({database:document.getElementById('database').value.trim(),
+                           ipserver:document.getElementById('ipserver').value.trim(),
+                           api_key:document.getElementById('apikey').value.trim()})});
+    var d=await r.json();
+    if(r.ok&&d.ok){btn.textContent='متصل شد ✓';setTimeout(function(){location.href=d.base||'/spider';},600);return;}
+    err.textContent=d.detail||'اتصال برقرار نشد';err.style.display='block';
+  }catch(e){err.textContent='ارتباط با پنل برقرار نشد';err.style.display='block';}
+  btn.disabled=false;btn.textContent='اتصال و راه‌اندازی';
+}
+</script>
+</body>
+</html>
+"""
+
+
+@app.post("/api/db-setup")
+async def api_db_setup(request: Request):
+    """The ONLY working API while the gate is active — connects the panel to
+    its external MySQL data server and unlocks the panel."""
+    if not DB_GATE["active"]:
+        raise HTTPException(status_code=409, detail="سرور داده از قبل تنظیم شده است")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad request")
+    database = str(body.get("database") or "").strip()
+    api_key = str(body.get("api_key") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", database):
+        raise HTTPException(status_code=400, detail="نام دیتابیس فقط حروف، عدد و زیرخط است")
+    if not re.fullmatch(r"[A-Za-z0-9]{40,128}", api_key):
+        raise HTTPException(status_code=400, detail="API key معتبر نیست")
+    try:
+        url = _db_parse_server(str(body.get("ipserver") or ""))
+    except _DbError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        await _db_ping(url, database, api_key)
+    except _DbError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    _db_boot_save(url, database, api_key)
+    DB_GATE.update(url=url, database=database, configured=True)
+    try:
+        raw = await _db_get(url, database, api_key, REMOTE_STATE_KEY)
+        if raw:
+            data = json.loads(raw)
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = DATA_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(DATA_FILE)
+            _reset_state_memory()
+            await load_state()
+        DB_GATE.update(active=False, connected=True, error="",
+                       last_sync=datetime.now().strftime("%H:%M:%S"))
+        if not raw:
+            await _save_state_now()
+    except _DbError as exc:
+        DB_GATE.update(active=True, connected=False, error=str(exc))
+        _db_boot_clear()
+        DB_GATE.update(url="", database="", configured=False)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        DB_GATE.update(active=True, connected=False, error="دیتای سرور داده قابل خواندن نیست")
+        _db_boot_clear()
+        DB_GATE.update(url="", database="", configured=False)
+        raise HTTPException(status_code=400, detail="دیتای روی سرور داده قابل خواندن نیست")
+    log_activity("system", f"پنل به سرور داده متصل شد ({database})", "ok")
+    # Bring the data plane up now that state is available.
+    try:
+        await _ensure_xray()
+        if _xray_bin_path().exists():
+            await _xray_apply()
+    except Exception as exc:
+        logger.warning("Xray start after db-setup failed: %s", exc)
+    global BOT_TASK
+    try:
+        from telegram_bot import start_bot as _sb, _cfg as _bcfg
+        if _bcfg().get("token") and (BOT_TASK is None):
+            BOT_TASK = _sb()
+    except Exception as exc:
+        logger.warning("Bot start after db-setup failed: %s", exc)
+    try:
+        await _start_all_telegram_proxies()
+    except Exception as exc:
+        logger.warning("TG proxies start after db-setup failed: %s", exc)
+    return {"ok": True, "base": _admin_base()}
+
+
+@app.get("/api/db-status")
+async def api_db_status():
+    """Public diagnostics for the data-server connection (no secrets)."""
+    return {"ok": True, "active": DB_GATE["active"], "configured": DB_GATE["configured"],
+            "database": DB_GATE["database"], "connected": DB_GATE["connected"],
+            "error": DB_GATE["error"], "last_sync": DB_GATE["last_sync"]}
+
+
+@app.get("/api/db-info")
+async def api_db_info(_=Depends(require_auth)):
+    return {"ok": True, "database": DB_GATE["database"], "url": DB_GATE["url"],
+            "connected": DB_GATE["connected"], "last_sync": DB_GATE["last_sync"],
+            "error": DB_GATE["error"]}
+
+
+@app.post("/api/db-unlink")
+async def api_db_unlink(_=Depends(require_auth)):
+    """Disconnect from the data server → panel locks until re-connected."""
+    _db_boot_clear()
+    DB_GATE.update(active=True, configured=False, url="", database="",
+                   connected=False, error="", last_sync="")
+    DB_GATE["gate_base"] = _admin_base()
+    log_activity("system", "اتصال به سرور داده قطع شد — پنل قفل شد", "err")
+    return {"ok": True}
+
+
 @app.on_event("startup")
 async def startup():
     global http_client
@@ -968,6 +1361,9 @@ async def startup():
         limits=limits, timeout=timeout, follow_redirects=True,
     )
     await load_state()
+    await _database_gate_boot()
+    if DB_GATE["active"]:
+        logger.warning("PANEL LOCKED — no external data server connected yet")
     # Background maintenance: coalescing state writer + batched usage flusher.
     global _SAVE_WRITER_TASK
     _SAVE_WRITER_TASK = asyncio.create_task(_state_writer_loop())
@@ -1311,13 +1707,15 @@ async def startup():
 
     # Ensure Xray is installed and serving reality BEFORE the panel is fully up,
     # so reality configs work immediately (not in a background task).
-    await _ensure_xray()
-    if _xray_bin_path().exists():
-        try:
-            await _xray_apply()
-        except Exception as e:
-            logger.warning(f"Xray apply on boot failed: {e}")
-    log_activity("system", "سرور راه‌اندازی شد", "ok")
+    # (skipped while the database gate is active — nothing runs without data)
+    if not DB_GATE["active"]:
+        await _ensure_xray()
+        if _xray_bin_path().exists():
+            try:
+                await _xray_apply()
+            except Exception as e:
+                logger.warning(f"Xray apply on boot failed: {e}")
+        log_activity("system", "سرور راه‌اندازی شد", "ok")
     logger.info(f"Spider Panel v8 (commit 24d7594) started on port {CONFIG['port']}")
     # Include XHTTP router for xhttp-siz10 endpoints (already merged into main.py)
     global xhttp_router
@@ -1327,20 +1725,22 @@ async def startup():
 
     # Start Telegram management/subscription bot (long-polling)
     global BOT_TASK
-    try:
-        from telegram_bot import start_bot, _cfg
-        _bot_cfg = _cfg()
-        if _bot_cfg.get("token"):
-            BOT_TASK = start_bot()
-            log_activity("telegram-bot", "ربات تلگرام متصل شد", "ok")
-            logger.info("Telegram bot task started")
-        else:
-            logger.info("Telegram bot disabled — set TELEGRAM_BOT_TOKEN or phone config in panel settings")
-    except Exception as _bot_err:
-        logger.warning("Telegram bot could not start: %s", _bot_err)
+    if not DB_GATE["active"]:
+        try:
+            from telegram_bot import start_bot, _cfg
+            _bot_cfg = _cfg()
+            if _bot_cfg.get("token"):
+                BOT_TASK = start_bot()
+                log_activity("telegram-bot", "ربات تلگرام متصل شد", "ok")
+                logger.info("Telegram bot task started")
+            else:
+                logger.info("Telegram bot disabled — set TELEGRAM_BOT_TOKEN or phone config in panel settings")
+        except Exception as _bot_err:
+            logger.warning("Telegram bot could not start: %s", _bot_err)
 
     # Start Telegram Proxy instances for all existing TG inbounds
-    await _start_all_telegram_proxies()
+    if not DB_GATE["active"]:
+        await _start_all_telegram_proxies()
     global NODE_HEARTBEAT_TASK
     if NODE_HEARTBEAT_TASK is None or NODE_HEARTBEAT_TASK.done():
         NODE_HEARTBEAT_TASK = asyncio.create_task(_node_heartbeat_loop(), name="spider-node-heartbeat")
@@ -1470,7 +1870,13 @@ async def _sync_tg_traffic(user_id: str, nbytes: int):
 
 @app.on_event("shutdown")
 async def shutdown():
-    global NODE_HEARTBEAT_TASK
+    global NODE_HEARTBEAT_TASK, _db_http
+    if _db_http is not None and not _db_http.is_closed:
+        try:
+            await _db_http.aclose()
+        except Exception:
+            pass
+        _db_http = None
     if NODE_HEARTBEAT_TASK is not None and not NODE_HEARTBEAT_TASK.done():
         NODE_HEARTBEAT_TASK.cancel()
         try:
@@ -3553,6 +3959,8 @@ _PORTAL_HEADERS = {
 @app.get("/sub/{sub_hash}")
 async def hashed_sub_route(sub_hash: str, request: Request):
     """`/sub/{hash}` — mirrors the worker's handleHashedSubRoute exactly."""
+    if DB_GATE["active"]:
+        raise HTTPException(status_code=503, detail="database_required")
     accept = (request.headers.get("Accept") or "").lower()
     ua = request.headers.get("User-Agent") or ""
     host = request.headers.get("Host") or get_host()
@@ -3769,6 +4177,8 @@ async def _login_clear(ip: str) -> None:
 
 @app.post("/api/login")
 async def api_login(request: Request):
+    if DB_GATE["active"]:
+        raise HTTPException(status_code=503, detail="database_required")
     body = await request.json()
     ip = client_ip(request)
     if not await _login_rate_allowed(ip):
@@ -3914,6 +4324,8 @@ async def verify_panel_api_key(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/me")
 async def api_me(request: Request):
+    if DB_GATE["active"]:
+        raise HTTPException(status_code=503, detail="database_required")
     """Return browser authentication and non-secret server identity."""
     auth = await is_valid_session(request.cookies.get(SESSION_COOKIE))
     info = await _build_server_info(refresh=auth)
@@ -5619,6 +6031,8 @@ async def api_sub_by_hash(sub_hash: str):
 
     The hash itself is the secret; knowing it is the only requirement.
     """
+    if DB_GATE["active"]:
+        raise HTTPException(status_code=503, detail="database_required")
     rec = validate_sub_hash(sub_hash)
     if rec is None or rec.get("revoked"):
         raise HTTPException(status_code=404, detail="subscription not found")
@@ -9950,6 +10364,11 @@ async def admin_gate(request: Request, page_path: str = ""):
     any previously-configured custom path stop existing immediately.
     """
     p = "/" + (page_path or "").strip("/")
+    if DB_GATE["active"]:
+        base = DB_GATE.get("gate_base") or "/spider"
+        if p in (base, base + "/login", "/setup"):
+            return HTMLResponse(content=_DB_SETUP_PAGE)
+        raise HTTPException(status_code=404)
     base = _admin_base()
     if p == base:
         if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
