@@ -394,7 +394,36 @@ def _rebuild_path_index():
         PATH_INDEX[config_uuid] = config_uuid
     logger.info(f"PATH_INDEX rebuilt: {len(PATH_INDEX)} entries")
 
+_SAVE_DIRTY = asyncio.Event()
+_SAVE_WRITER_TASK: asyncio.Task | None = None
+SAVE_STATE_MIN_INTERVAL = float(os.environ.get("SAVE_STATE_MIN_INTERVAL", "3"))
+
+
 async def save_state():
+    """Mark state dirty; a single coalescing writer persists it.
+
+    Bursts of save_state() calls (connection churn, bot actions, edits) used
+    to JSON-serialize the ENTIRE state and hit the disk once per call. The
+    actual write now runs at most once per SAVE_STATE_MIN_INTERVAL seconds.
+    """
+    _SAVE_DIRTY.set()
+
+
+async def _state_writer_loop():
+    while True:
+        try:
+            await _SAVE_DIRTY.wait()
+            await asyncio.sleep(SAVE_STATE_MIN_INTERVAL)
+            _SAVE_DIRTY.clear()
+            await _save_state_now()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"state writer failed: {exc}")
+            await asyncio.sleep(2)
+
+
+async def _save_state_now():
     async with SAVE_LOCK:
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -943,6 +972,16 @@ async def startup():
         limits=limits, timeout=timeout, follow_redirects=True,
     )
     await load_state()
+    # Background maintenance: coalescing state writer + batched usage flusher.
+    global _SAVE_WRITER_TASK
+    _SAVE_WRITER_TASK = asyncio.create_task(_state_writer_loop())
+    asyncio.create_task(_relay_usage_flush_loop())
+    # Prime psutil's non-blocking CPU counter (first interval=None call is 0.0).
+    try:
+        import psutil as _ps
+        _ps.cpu_percent(None)
+    except Exception:
+        pass
     # Ensure the exact default TLS+WS inbound exists. It is the ONLY inbound
     # served by the FastAPI /ws/{uuid} relay.
     async with INBOUNDS_LOCK:
@@ -1454,7 +1493,15 @@ async def shutdown():
     except Exception as _bot_err:
         logger.warning("Telegram bot stop failed: %s", _bot_err)
     BOT_TASK = None
-    await save_state()
+    global _SAVE_WRITER_TASK
+    try:
+        await _relay_usage_flush_now()
+    except Exception:
+        pass
+    if _SAVE_WRITER_TASK is not None and not _SAVE_WRITER_TASK.done():
+        _SAVE_WRITER_TASK.cancel()
+        _SAVE_WRITER_TASK = None
+    await _save_state_now()
     if http_client:
         await http_client.aclose()
 
@@ -6593,7 +6640,7 @@ _SESSION_PROXY: dict = {}
 XHTTP_BUF = 512 * 1024
 DOWNLINK_QUEUE_MAX = 512
 SESSION_IDLE_TIMEOUT = 30
-REAPER_INTERVAL = 10
+REAPER_INTERVAL = int(os.environ.get("XHTTP_REAPER_INTERVAL", "30"))
 TCP_CONNECT_TIMEOUT = 10.0
 
 # ── تنظیمات موتور تطبیقی ──────────────────────────────────────────────────────
@@ -7108,27 +7155,95 @@ async def parse_vless_header(chunk: bytes, expected_uuid: str | None = None):
         raise ValueError(f"unknown addr type: {addr_type}")
     return command, address, port, chunk[pos:]
 
-async def check_and_use(uid: str, n: int) -> bool:
+# ── Relay usage accounting (batched) ─────────────────────────────────────────
+# Per-chunk lock churn was the relay's biggest CPU cost: every WS chunk grabbed
+# LINKS_LOCK + USERS_LOCK and parsed the ISO expiry string. Chunks now land in
+# a loop-local pending bucket (no locks: the event loop is single-threaded and
+# the update never awaits) and a flusher commits everything to LINKS / USERS /
+# hourly_traffic every RELAY_FLUSH_INTERVAL seconds. Enforcement latency is
+# therefore ≤ one flush window — the same trade-off the XHTTP _QuotaGate makes.
+RELAY_FLUSH_INTERVAL = float(os.environ.get("RELAY_FLUSH_INTERVAL", "2"))
+_RELAY_CHECK_BUCKET = max(1, int(RELAY_FLUSH_INTERVAL))
+_RELAY_USAGE: dict = {}       # config_uuid → uncommitted bytes
+_RELAY_EXPIRY_OK: dict = {}   # config_uuid → (monotonic bucket, expired?)
+
+
+def _relay_account(uid: str, n: int) -> bool:
+    """Synchronous per-chunk quota gate — dict ops only, zero locks/awaits.
+
+    Exact per-chunk enforcement (limit/active), while the ISO-expiry parse —
+    the only costly check — is memoized per uid for one flush window.
+    """
     m = _get_main()
-    async with m.LINKS_LOCK:
-        link = m.LINKS.get(uid)
-        if link is None:
+    link = m.LINKS.get(uid)
+    if link is None:
+        return False
+    pending = _RELAY_USAGE.get(uid, 0) + n
+    limit = link.get("limit_bytes", 0) or 0
+    if limit and (link.get("used_bytes", 0) + pending) > limit:
+        return False
+    if link.get("active", True) is False:
+        return False
+    exp = link.get("expires_at")
+    if exp:
+        bucket = int(time.monotonic() / _RELAY_CHECK_BUCKET)
+        hit = _RELAY_EXPIRY_OK.get(uid)
+        if hit is None or hit[0] != bucket:
+            try:
+                expired = datetime.now() > datetime.fromisoformat(exp)
+            except Exception:
+                expired = False
+            _RELAY_EXPIRY_OK[uid] = (bucket, expired)
+            if expired:
+                return False
+        elif hit[1]:
             return False
-        if not m.is_link_allowed(link):
-            return False
-        link["used_bytes"] += n
-        stats["total_bytes"] += n
-        hourly_traffic[m.now_ir().strftime("%H:00")] += n
-
-    # Sync traffic back to user (so subscription page shows real usage)
-    user_id = link.get("user_id")
-    if user_id:
-        async with m.USERS_LOCK:
-            u = m.USERS.get(user_id)
-            if u:
-                u["traffic_used_bytes"] = u.get("traffic_used_bytes", 0) + n
-
+    _RELAY_USAGE[uid] = pending
+    stats["total_bytes"] += n
     return True
+
+
+async def _relay_usage_flush_now() -> int:
+    """Commit pending relay bytes into LINKS / USERS / hourly_traffic."""
+    if not _RELAY_USAGE:
+        return 0
+    m = _get_main()
+    pending = dict(_RELAY_USAGE)
+    _RELAY_USAGE.clear()
+    for uid in [u for u in _RELAY_EXPIRY_OK if u not in m.LINKS]:
+        _RELAY_EXPIRY_OK.pop(uid, None)
+    hour = m.now_ir().strftime("%H:00")
+    by_user: dict = {}
+    async with m.LINKS_LOCK:
+        for uid, nb in pending.items():
+            link = m.LINKS.get(uid)
+            if link:
+                link["used_bytes"] = link.get("used_bytes", 0) + nb
+                wuid = str(link.get("user_id") or "")
+                if wuid:
+                    by_user[wuid] = by_user.get(wuid, 0) + nb
+    hourly_traffic[hour] += sum(pending.values())
+    if by_user:
+        async with m.USERS_LOCK:
+            for wuid, nb in by_user.items():
+                u = m.USERS.get(wuid)
+                if u:
+                    u["traffic_used_bytes"] = u.get("traffic_used_bytes", 0) + nb
+    return len(pending)
+
+
+async def _relay_usage_flush_loop():
+    while True:
+        await asyncio.sleep(RELAY_FLUSH_INTERVAL)
+        try:
+            await _relay_usage_flush_now()
+        except Exception as exc:
+            logger.debug(f"relay usage flush failed: {exc}")
+
+
+async def check_and_use(uid: str, n: int) -> bool:
+    """Compat wrapper — routes through the batched accounting."""
+    return _relay_account(uid, n)
 
 async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: str, uid: str):
     try:
@@ -7139,7 +7254,7 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: 
             data = msg.get("bytes") or (msg.get("text") or "").encode()
             if not data:
                 continue
-            if not await check_and_use(uid, len(data)):
+            if not _relay_account(uid, len(data)):
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             stats["total_requests"] += 1
@@ -7162,7 +7277,7 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
             data = await reader.read(RELAY_BUF_LOCAL)
             if not data:
                 break
-            if not await check_and_use(uid, len(data)):
+            if not _relay_account(uid, len(data)):
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             connections[conn_id]["bytes"] += len(data)
@@ -7213,7 +7328,7 @@ async def websocket_tunnel(ws: WebSocket, uuid: str, proxy_override: str = None)
         "connected_at": datetime.now().isoformat(),
         "bytes": 0,
     }
-    logger.info(f"WS [{conn_id}] uuid={uuid[:8]}… ip={ip} total={len(connections)}")
+    logger.debug(f"WS [{conn_id}] uuid={uuid[:8]}… ip={ip} total={len(connections)}")
     m.log_activity("connection", f"اتصال جدید از {ip} (کانفیگ {link.get('label','?')})", "info")
 
     # Enforce per-user IP limit using the real connection IP
@@ -7239,7 +7354,7 @@ async def websocket_tunnel(ws: WebSocket, uuid: str, proxy_override: str = None)
 
         stats["total_requests"] += 1
         connections[conn_id]["bytes"] += len(first_chunk)
-        logger.info(f"[{conn_id}] → {address}:{port}")
+        logger.debug(f"[{conn_id}] → {address}:{port}")
 
         # Route the outbound connection through the user's selected proxy IP(s),
         # so egress shows the proxy IP instead of the Railway host.
@@ -7291,7 +7406,7 @@ async def websocket_tunnel(ws: WebSocket, uuid: str, proxy_override: str = None)
             asyncio.create_task(m.release_ip_for_link(uuid, ip))
         except Exception:
             pass
-        logger.info(f"WS closed [{conn_id}] total={len(connections)}")
+        logger.debug(f"WS closed [{conn_id}] total={len(connections)}")
 
 
 @app.get("/api/node/identity")
@@ -8007,12 +8122,19 @@ async def check_ip(request: Request, _=Depends(require_auth)):
 ws_client_count = 0
 WS_LIVE_CLIENTS: set = set()
 
+_LIVE_STATS_CACHE: dict = {"ts": 0.0, "data": None}
+_LIVE_STATS_TTL = float(os.environ.get("LIVE_STATS_TTL", "2"))
+
+
 def get_live_stats() -> dict:
-    """Get real server stats using psutil with fallback."""
+    """Get real server stats using psutil with fallback (cached _LIVE_STATS_TTL s)."""
+    _now = time.time()
+    if _LIVE_STATS_CACHE["data"] is not None and (_now - _LIVE_STATS_CACHE["ts"]) < _LIVE_STATS_TTL:
+        return _LIVE_STATS_CACHE["data"]
     conn_count = len(connections)
     try:
         import psutil as _ps
-        cpu_pct = round(_ps.cpu_percent(interval=0.3), 1)
+        cpu_pct = round(_ps.cpu_percent(interval=None), 1)
         mem = _ps.virtual_memory()
         ram_pct = round(mem.percent, 1)
         ram_used_gb = round(mem.used / (1024**3), 2)
@@ -8039,7 +8161,7 @@ def get_live_stats() -> dict:
     # Calculate total traffic from all users
     total_used = sum(u.get("traffic_used_bytes", 0) for u in USERS.values())
     total_limit = sum(u.get("traffic_limit_bytes", 0) for u in USERS.values())
-    return {
+    out = {
         "cpu_percent": max(0, cpu_pct),
         "ram_percent": max(0, ram_pct),
         "ram_used_gb": ram_used_gb,
@@ -8061,6 +8183,12 @@ def get_live_stats() -> dict:
         "uptime_seconds": uptime_secs(),
         "timestamp": datetime.now().isoformat(),
     }
+    _LIVE_STATS_CACHE["ts"] = _now
+    _LIVE_STATS_CACHE["data"] = out
+    return out
+
+
+LIVE_STATS_INTERVAL = float(os.environ.get("LIVE_STATS_INTERVAL", "3"))
 
 
 @app.websocket("/ws/live")
@@ -8074,7 +8202,7 @@ async def websocket_live_stats(websocket: WebSocket):
             try:
                 stats_data = get_live_stats()
                 await websocket.send_json(stats_data)
-                await asyncio.sleep(2)
+                await asyncio.sleep(LIVE_STATS_INTERVAL)
             except WebSocketDisconnect:
                 break
             except Exception:
@@ -9730,4 +9858,11 @@ async def scanner_sni_fastest(_=Depends(require_auth)):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", workers=1)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=CONFIG["port"],
+        log_level=os.environ.get("UVICORN_LOG_LEVEL", "warning"),
+        access_log=False,
+        workers=1,
+    )

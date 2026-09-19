@@ -1220,7 +1220,7 @@ WorkingDirectory=$APP_DIR
 EnvironmentFile=$ENV_FILE
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=$VENV/bin/uvicorn main:app --host 0.0.0.0 --port 8080
+ExecStart=$VENV/bin/uvicorn main:app --host 0.0.0.0 --port 8080 --no-access-log --log-level warning
 Restart=always
 RestartSec=5
 KillSignal=SIGINT
@@ -1311,6 +1311,8 @@ start_panel() {
             main:app \
             --host 0.0.0.0 \
             --port 8080 \
+            --no-access-log \
+            --log-level warning \
             >> "$LOGFILE" 2>&1 &
 
 
