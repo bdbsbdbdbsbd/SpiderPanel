@@ -976,10 +976,19 @@ async def _ensure_xray() -> bool:
 DB_BOOT_FILE = DATA_DIR / "db_config.json"
 REMOTE_STATE_KEY = "spider_state"
 DEFAULT_DATA_SERVER_PORT = 8200
+DEFAULT_MYSQL_PORT = 3306
+
+try:
+    import aiomysql  # direct-MySQL mode
+except Exception:  # pragma: no cover
+    aiomysql = None
+
+_MYSQL_SYSTEM_DBS = {"information_schema", "mysql", "performance_schema", "sys", "test"}
 
 DB_GATE: dict = {
     "active": True,          # True → panel locked (setup page only)
     "configured": False,
+    "mode": "",              # "direct" | "manager"
     "url": "",
     "database": "",
     "connected": False,
@@ -1000,6 +1009,12 @@ def _db_boot_load() -> dict | None:
     try:
         with open(DB_BOOT_FILE, encoding="utf-8") as f:
             cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            return None
+        if cfg.get("mode") == "direct":
+            if cfg.get("host") and cfg.get("user") and cfg.get("database"):
+                return cfg
+            return None
         if cfg.get("url") and cfg.get("database") and cfg.get("api_key"):
             return cfg
     except Exception:
@@ -1092,6 +1107,156 @@ async def _db_get(url: str, database: str, api_key: str, key: str) -> str | None
     return out.get("value") if out.get("found") else None
 
 
+# ── direct-MySQL mode engine ─────────────────────────────────────────────────
+_db_pool = None
+_db_pool_lock = asyncio.Lock()
+
+
+class _MySQLError(Exception):
+    """Persian, user-safe MySQL error."""
+
+
+def _mysql_error(exc: Exception) -> _MySQLError:
+    import pymysql
+    code = getattr(exc, "args", [None])[0] if isinstance(exc, pymysql.err.OperationalError) else None
+    text = str(exc)
+    if isinstance(exc, pymysql.err.OperationalError) and code in (1044, 1045, 1698):
+        return _MySQLError("یوزرنیم یا پسورد MySQL اشتباه است")
+    if isinstance(exc, pymysql.err.OperationalError) and code in (2003, 2002):
+        return _MySQLError("اتصال به سرور MySQL برقرار نشد؛ آی‌پی/پورت را چک کنید")
+    if isinstance(exc, pymysql.err.OperationalError) and code == 1049:
+        return _MySQLError("این دیتابیس روی سرور وجود ندارد")
+    if isinstance(exc, pymysql.err.OperationalError) and code == 1040:
+        return _MySQLError("سرور MySQL ظرفیت اتصال بیشتری ندارد (Too many connections)")
+    if "timed out" in text.lower() or "timeout" in text.lower():
+        return _MySQLError("اتصال به سرور MySQL تایم‌اوت شد")
+    return _MySQLError("خطای MySQL: " + text[:120])
+
+
+def _db_parse_mysql_endpoint(raw: str) -> tuple:
+    """host:port (port optional, default 3306) → (host, port)."""
+    s = str(raw or "").strip()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.rstrip("/").split("/")[0]
+    if not s:
+        raise _DbError("آی‌پی سرور MySQL را وارد کنید")
+    if ":" in s:
+        host, _, port_s = s.rpartition(":")
+        if not host or not port_s.isdigit() or not (1 <= int(port_s) <= 65535):
+            raise _DbError("پورت MySQL معتبر نیست")
+        return host, int(port_s)
+    return s, DEFAULT_MYSQL_PORT
+
+
+async def _mysql_pool_get():
+    global _db_pool
+    if aiomysql is None:
+        raise _MySQLError("ماژول aiomysql نصب نیست (pip install aiomysql)")
+    async with _db_pool_lock:
+        if _db_pool is None:
+            cfg = _db_boot_load()
+            if not cfg or cfg.get("mode") != "direct":
+                raise _MySQLError("اتصال مستقیم MySQL تنظیم نشده است")
+            try:
+                import warnings as _w
+                _w.filterwarnings("ignore", message="Table 'kv' already exists")
+                _db_pool = await aiomysql.create_pool(
+                    host=cfg["host"], port=int(cfg.get("port") or DEFAULT_MYSQL_PORT),
+                    user=cfg["user"], password=str(cfg.get("password") or ""),
+                    autocommit=True, minsize=1, maxsize=3,
+                    pool_recycle=1740, connect_timeout=8, charset="utf8mb4")
+            except Exception as exc:
+                raise _mysql_error(exc)
+        return _db_pool
+
+
+async def _mysql_pool_close() -> None:
+    global _db_pool
+    async with _db_pool_lock:
+        if _db_pool is not None:
+            try:
+                _db_pool.close()
+                await _db_pool.wait_closed()
+            except Exception:
+                pass
+            _db_pool = None
+
+
+async def _mysql_exec(sql: str, args: tuple = (), *, db: str = ""):
+    """Run one statement on the direct pool; rebuild the pool once on failure."""
+    for attempt in (1, 2):
+        pool = await _mysql_pool_get()
+        conn = None
+        try:
+            conn = await pool.acquire()
+            if db:
+                await conn.select_db(db)
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(sql, args)
+                try:
+                    return await cur.fetchall()
+                except Exception:
+                    return []
+        except Exception as exc:
+            if conn is not None:
+                try:
+                    pool.release(conn)
+                except Exception:
+                    pass
+                conn = None
+            if attempt == 1:
+                await _mysql_pool_close()  # stale pool → rebuild and retry once
+                continue
+            raise _mysql_error(exc)
+        finally:
+            if conn is not None:
+                try:
+                    pool.release(conn)
+                except Exception:
+                    pass
+
+
+async def _mysql_probe(host: str, port: int, user: str, password: str) -> None:
+    """One-shot credential check + capability probe (used by db-setup)."""
+    if aiomysql is None:
+        raise _MySQLError("ماژول aiomysql نصب نیست (pip install aiomysql)")
+    try:
+        conn = await aiomysql.connect(host=host, port=port, user=user,
+                                      password=password, connect_timeout=8,
+                                      charset="utf8mb4")
+    except Exception as exc:
+        raise _mysql_error(exc)
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute("SHOW DATABASES")
+            rows = await cur.fetchall()
+            return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
+async def _mysql_kv_ensure(db: str) -> None:
+    await _mysql_exec(
+        "CREATE TABLE IF NOT EXISTS `kv` ("
+        " k VARCHAR(191) PRIMARY KEY,"
+        " v LONGTEXT NOT NULL,"
+        " updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4", (), db=db)
+
+
+async def _mysql_kv_set(db: str, key: str, value: str) -> None:
+    await _mysql_kv_ensure(db)
+    await _mysql_exec(
+        "INSERT INTO kv (k, v) VALUES (%s, %s) ON DUPLICATE KEY UPDATE v=VALUES(v)",
+        (key, value), db=db)
+
+
+async def _mysql_kv_get(db: str, key: str):
+    rows = await _mysql_exec("SELECT v FROM kv WHERE k=%s", (key,), db=db)
+    return rows[0]["v"] if rows else None
+
+
 def _gate_base_from_cache() -> str:
     """Admin base while locked — read from the local cache (emergency mode)."""
     try:
@@ -1124,10 +1289,15 @@ async def _database_gate_boot() -> None:
         DB_GATE.update(active=True, configured=False, connected=False, error="")
         logger.warning("No data server configured — panel is LOCKED until a database is set up")
         return
-    DB_GATE.update(configured=True, url=boot["url"], database=boot["database"])
     try:
-        await _db_ping(boot["url"], boot["database"], boot["api_key"])
-        raw = await _db_get(boot["url"], boot["database"], boot["api_key"], REMOTE_STATE_KEY)
+        if boot.get("mode") == "direct":
+            DB_GATE.update(configured=True, mode="direct", url=f"mysql://{boot['host']}:{boot.get('port', 3306)}",
+                           database=boot["database"])
+            raw = await _mysql_kv_get(boot["database"], REMOTE_STATE_KEY)
+        else:
+            DB_GATE.update(configured=True, mode="manager", url=boot["url"], database=boot["database"])
+            await _db_ping(boot["url"], boot["database"], boot["api_key"])
+            raw = await _db_get(boot["url"], boot["database"], boot["api_key"], REMOTE_STATE_KEY)
         if raw:
             data = json.loads(raw)
             DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1136,7 +1306,7 @@ async def _database_gate_boot() -> None:
             tmp.replace(DATA_FILE)
             _reset_state_memory()
             await load_state()
-            logger.info("State pulled from data server (%d bytes)", len(raw))
+            logger.info("State pulled from external database (%d bytes)", len(raw))
         DB_GATE.update(active=False, connected=True, error="")
         if not raw:
             # Fresh remote database → adopt the local cache as the initial state.
@@ -1164,9 +1334,12 @@ async def _db_push_worker() -> None:
         while _db_push_pending is not None:
             payload, _db_push_pending = _db_push_pending, None
             try:
-                await _db_set(DB_GATE["url"], DB_GATE["database"],
-                              (_db_boot_load() or {}).get("api_key", ""),
-                              REMOTE_STATE_KEY, payload)
+                if DB_GATE.get("mode") == "direct":
+                    await _mysql_kv_set(DB_GATE["database"], REMOTE_STATE_KEY, payload)
+                else:
+                    await _db_set(DB_GATE["url"], DB_GATE["database"],
+                                  (_db_boot_load() or {}).get("api_key", ""),
+                                  REMOTE_STATE_KEY, payload)
                 DB_GATE.update(connected=True, error="",
                                last_sync=datetime.now().strftime("%H:%M:%S"))
             except Exception as exc:
@@ -1180,70 +1353,117 @@ _DB_SETUP_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>اتصال به سرور داده — Spider Panel</title>
+<title>اتصال به دیتابیس — Spider Panel</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box;margin:0;padding:0}
 body{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
 background:radial-gradient(900px 500px at 85% -10%,rgba(0,225,193,.08),transparent 60%),#101013;
 color:#f4f4f5;font-family:Vazirmatn,-apple-system,'Segoe UI',Tahoma,sans-serif}
-.card{width:100%;max-width:460px;border:1px solid #2b2b33;border-radius:22px;background:#151519;
-padding:36px 30px;box-shadow:0 30px 80px rgba(0,0,0,.45)}
+.card{width:100%;max-width:470px;border:1px solid #2b2b33;border-radius:22px;background:#151519;
+padding:34px 30px;box-shadow:0 30px 80px rgba(0,0,0,.45)}
 .logo{text-align:center;font-size:26px;font-weight:800;letter-spacing:.35em;color:#fff}
 .logo small{display:block;font-size:10px;letter-spacing:.6em;color:#8b8b96;margin-top:6px}
-h1{font-size:16px;margin:26px 0 4px;text-align:center}
-.sub{font-size:12.5px;color:#9a9aa5;text-align:center;line-height:2;margin-bottom:22px}
-.f{margin-bottom:14px}
+h1{font-size:16px;margin:24px 0 4px;text-align:center}
+.sub{font-size:12.5px;color:#9a9aa5;text-align:center;line-height:2;margin-bottom:18px}
+.tabs{display:flex;background:#101014;border:1px solid #2b2b33;border-radius:12px;padding:4px;gap:4px;margin-bottom:18px}
+.tab{flex:1;border:0;background:transparent;color:#9a9aa5;font:700 12.5px inherit;padding:9px;
+border-radius:9px;cursor:pointer;transition:all .2s;font-family:inherit}
+.tab.on{background:#00e1c1;color:#04110e}
+.f{margin-bottom:13px}
+#f-manager{display:none}
+#f-manager.on{display:block}
 label{display:block;font-size:12px;font-weight:700;color:#c9c9ce;margin-bottom:6px}
+label small{color:#6b6b76;font-weight:400}
 input{width:100%;background:#1d1d22;border:1px solid #313136;border-radius:11px;color:#fff;
 padding:11px 13px;font-size:14px;outline:none;direction:ltr;text-align:left;font-family:inherit}
 input:focus{border-color:#00e1c1}
 .err{display:none;background:rgba(255,80,90,.1);border:1px solid rgba(255,80,90,.35);color:#ff9aa2;
-border-radius:11px;padding:10px 13px;font-size:12.5px;line-height:1.9;margin-bottom:14px}
-button{width:100%;border:0;cursor:pointer;background:#00e1c1;color:#04110e;font-weight:800;
+border-radius:11px;padding:10px 13px;font-size:12.5px;line-height:1.9;margin-bottom:14px;direction:rtl}
+button.go{width:100%;border:0;cursor:pointer;background:#00e1c1;color:#04110e;font-weight:800;
 font-size:14.5px;padding:13px;border-radius:12px;font-family:inherit;transition:filter .2s}
-button:hover{filter:brightness(1.08)}
-button:disabled{filter:grayscale(.4);cursor:wait}
-.hint{margin-top:18px;font-size:11px;color:#6b6b76;line-height:2;text-align:center}
+button.go:hover{filter:brightness(1.08)}
+button.go:disabled{filter:grayscale(.4);cursor:wait}
+.hint{margin-top:16px;font-size:11px;color:#6b6b76;line-height:2;text-align:center}
 .hint code{direction:ltr;display:inline-block;background:#1d1d22;padding:1px 7px;border-radius:6px}
 </style>
 </head>
 <body>
 <div class="card">
   <div class="logo">SPIDER<small>PANEL</small></div>
-  <h1>اتصال به سرور داده</h1>
-  <p class="sub">این پنل بدون دیتابیس خارجی کار نمی‌کند.<br>اطلاعات اتصال را از فایل <code>database.yml</code> سرور داده بگیرید.</p>
+  <h1>اتصال به دیتابیس</h1>
+  <p class="sub">این پنل بدون دیتابیس خارجی کار نمی‌کند.<br>همه اطلاعات (کاربران، تنظیمات، لینک‌ها) در MySQL ذخیره می‌شود.</p>
+  <div class="tabs">
+    <button type="button" class="tab on" id="tab-direct" onclick="setMode('direct')">اتصال مستقیم MySQL</button>
+    <button type="button" class="tab" id="tab-manager" onclick="setMode('manager')">سرور داده (API)</button>
+  </div>
   <div class="err" id="err"></div>
   <form onsubmit="connect(event)">
-    <div class="f">
-      <label>database? (نام دیتابیس)</label>
-      <input id="database" placeholder="database1" autocomplete="off" required>
+    <div class="f on" id="f-direct">
+      <div class="f">
+        <label>آی‌پی سرور MySQL <small>(آی‌پی یا آی‌پی:پورت — پیش‌فرض 3306)</small></label>
+        <input id="d-endpoint" placeholder="91.99.159.222:3306" autocomplete="off">
+      </div>
+      <div class="f">
+        <label>یوزرنیم MySQL</label>
+        <input id="d-user" placeholder="u46804_XXXXXXXX" autocomplete="off">
+      </div>
+      <div class="f">
+        <label>پسورد MySQL</label>
+        <input id="d-pass" type="password" placeholder="••••••••" autocomplete="off">
+      </div>
+      <div class="f">
+        <label>اسم دیتابیس <small>(خالی بگذار = خودکار پیدا می‌شود)</small></label>
+        <input id="d-db" placeholder="خودکار" autocomplete="off">
+      </div>
     </div>
-    <div class="f">
-      <label>ipserver: (آی‌پی یا آی‌پی:پورت سرور داده)</label>
-      <input id="ipserver" placeholder="51.20.10.5:8200" autocomplete="off" required>
+    <div class="f" id="f-manager">
+      <div class="f">
+        <label>database? (نام دیتابیس)</label>
+        <input id="m-database" placeholder="database1" autocomplete="off">
+      </div>
+      <div class="f">
+        <label>ipserver: (آی‌پی:پورت سرور داده)</label>
+        <input id="m-ipserver" placeholder="51.20.10.5:8200" autocomplete="off">
+      </div>
+      <div class="f">
+        <label>apikey:</label>
+        <input id="m-apikey" placeholder="64 کاراکتر hex" autocomplete="off">
+      </div>
     </div>
-    <div class="f">
-      <label>apikey:</label>
-      <input id="apikey" placeholder="64 کاراکتر hex" autocomplete="off" required>
-    </div>
-    <button id="btn" type="submit">اتصال و راه‌اندازی</button>
+    <button class="go" id="btn" type="submit">اتصال و راه‌اندازی</button>
   </form>
-  <p class="hint">همه اطلاعات پنل (کاربران، تنظیمات، لینک‌ها) در MySQL سرور داده ذخیره می‌شود.</p>
+  <p class="hint">حالت مستقیم با هر هاست MySQL کار می‌کند <code>HidenCloud</code> و مشابه آن — اسم دیتابیس را ندارید؟ خالی بگذارید.</p>
 </div>
 <script>
+var MODE='direct';
+function setMode(m){
+  MODE=m;
+  document.getElementById('tab-direct').classList.toggle('on',m==='direct');
+  document.getElementById('tab-manager').classList.toggle('on',m==='manager');
+  document.getElementById('f-direct').classList.toggle('on',m==='direct');
+  document.getElementById('f-manager').classList.toggle('on',m==='manager');
+  document.getElementById('err').style.display='none';
+}
+function v(id){return document.getElementById(id).value.trim();}
 async function connect(ev){
   ev.preventDefault();
   var err=document.getElementById('err'), btn=document.getElementById('btn');
   err.style.display='none'; btn.disabled=true; btn.textContent='در حال اتصال...';
+  var payload={mode:MODE};
+  if(MODE==='direct'){
+    payload.ipserver=v('d-endpoint'); payload.mysql_user=v('d-user');
+    payload.mysql_pass=document.getElementById('d-pass').value;
+    payload.database=v('d-db');
+  }else{
+    payload.database=v('m-database'); payload.ipserver=v('m-ipserver'); payload.api_key=v('m-apikey');
+  }
   try{
     var r=await fetch('/api/db-setup',{method:'POST',credentials:'same-origin',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({database:document.getElementById('database').value.trim(),
-                           ipserver:document.getElementById('ipserver').value.trim(),
-                           api_key:document.getElementById('apikey').value.trim()})});
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     var d=await r.json();
-    if(r.ok&&d.ok){btn.textContent='متصل شد ✓';setTimeout(function(){location.href=d.base||'/spider';},600);return;}
+    if(r.ok&&d.ok){btn.textContent='متصل شد ✓ (دیتابیس: '+(d.database||'?')+')';
+      setTimeout(function(){location.href=d.base||'/spider';},700);return;}
     err.textContent=d.detail||'اتصال برقرار نشد';err.style.display='block';
   }catch(e){err.textContent='ارتباط با پنل برقرار نشد';err.style.display='block';}
   btn.disabled=false;btn.textContent='اتصال و راه‌اندازی';
@@ -1254,58 +1474,8 @@ async function connect(ev){
 """
 
 
-@app.post("/api/db-setup")
-async def api_db_setup(request: Request):
-    """The ONLY working API while the gate is active — connects the panel to
-    its external MySQL data server and unlocks the panel."""
-    if not DB_GATE["active"]:
-        raise HTTPException(status_code=409, detail="سرور داده از قبل تنظیم شده است")
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="bad request")
-    database = str(body.get("database") or "").strip()
-    api_key = str(body.get("api_key") or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", database):
-        raise HTTPException(status_code=400, detail="نام دیتابیس فقط حروف، عدد و زیرخط است")
-    if not re.fullmatch(r"[A-Za-z0-9]{40,128}", api_key):
-        raise HTTPException(status_code=400, detail="API key معتبر نیست")
-    try:
-        url = _db_parse_server(str(body.get("ipserver") or ""))
-    except _DbError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    try:
-        await _db_ping(url, database, api_key)
-    except _DbError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    _db_boot_save(url, database, api_key)
-    DB_GATE.update(url=url, database=database, configured=True)
-    try:
-        raw = await _db_get(url, database, api_key, REMOTE_STATE_KEY)
-        if raw:
-            data = json.loads(raw)
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = DATA_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(DATA_FILE)
-            _reset_state_memory()
-            await load_state()
-        DB_GATE.update(active=False, connected=True, error="",
-                       last_sync=datetime.now().strftime("%H:%M:%S"))
-        if not raw:
-            await _save_state_now()
-    except _DbError as exc:
-        DB_GATE.update(active=True, connected=False, error=str(exc))
-        _db_boot_clear()
-        DB_GATE.update(url="", database="", configured=False)
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception:
-        DB_GATE.update(active=True, connected=False, error="دیتای سرور داده قابل خواندن نیست")
-        _db_boot_clear()
-        DB_GATE.update(url="", database="", configured=False)
-        raise HTTPException(status_code=400, detail="دیتای روی سرور داده قابل خواندن نیست")
-    log_activity("system", f"پنل به سرور داده متصل شد ({database})", "ok")
-    # Bring the data plane up now that state is available.
+async def _db_unlock_bringup() -> None:
+    """After a successful connection: boot the data plane (Xray, bot, proxies)."""
     try:
         await _ensure_xray()
         if _xray_bin_path().exists():
@@ -1323,6 +1493,147 @@ async def api_db_setup(request: Request):
         await _start_all_telegram_proxies()
     except Exception as exc:
         logger.warning("TG proxies start after db-setup failed: %s", exc)
+
+
+@app.post("/api/db-setup")
+async def api_db_setup(request: Request):
+    """The ONLY working API while the gate is active.
+
+    Two modes:
+      - direct  → paste any external MySQL (host:port + user + pass); the
+                  database name is optional and auto-detected (HidenCloud, …)
+      - manager → connect through a data-server-manager instance (api key)
+    """
+    if not DB_GATE["active"]:
+        raise HTTPException(status_code=409, detail="سرور داده از قبل تنظیم شده است")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad request")
+    mode = str(body.get("mode") or ("direct" if body.get("mysql_user") else "manager")).strip()
+
+    if mode == "direct":
+        try:
+            host, port = _db_parse_mysql_endpoint(str(body.get("ipserver") or ""))
+        except _DbError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        mysql_user = str(body.get("mysql_user") or "").strip()
+        mysql_pass = str(body.get("mysql_pass") or "")
+        database = str(body.get("database") or "").strip()
+        if not mysql_user:
+            raise HTTPException(status_code=400, detail="یوزرنیم MySQL را وارد کنید")
+        if len(mysql_pass) > 256 or len(database) > 64:
+            raise HTTPException(status_code=400, detail="مقدار واردشده بیش از حد طولانی است")
+        if database and not re.fullmatch(r"[A-Za-z0-9_]{1,64}", database):
+            raise HTTPException(status_code=400, detail="نام دیتابیس فقط حروف، عدد و زیرخط است")
+        # 1) credential probe + database discovery
+        try:
+            available = await _mysql_probe(host, port, mysql_user, mysql_pass)
+        except _MySQLError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        candidates = [d for d in available if d.lower() not in _MYSQL_SYSTEM_DBS]
+        if not database:
+            if len(candidates) == 1:
+                database = candidates[0]
+            elif len(candidates) == 0:
+                raise HTTPException(status_code=400,
+                                    detail="هیچ دیتابیسی برای این یوزر پیدا نشد")
+            else:
+                raise HTTPException(status_code=400,
+                                    detail="چند دیتابیس در دسترس است؛ یکی را انتخاب کنید: "
+                                           + "، ".join(candidates[:8]))
+        elif database not in candidates:
+                raise HTTPException(status_code=400,
+                                    detail="دیتابیس %r در دسترس این یوزر نیست؛ موجود: %s"
+                                           % (database, "، ".join(candidates[:8] or ["—"])))
+        # 2) persist credentials + kv table, pull state, unlock
+        boot = {"mode": "direct", "host": host, "port": port,
+                "user": mysql_user, "password": mysql_pass, "database": database}
+        try:
+            await _mysql_pool_close()
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = DB_BOOT_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(boot, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(DB_BOOT_FILE)
+            DB_GATE.update(url=f"mysql://{host}:{port}", database=database,
+                           mode="direct", configured=True)
+            await _mysql_kv_ensure(database)
+            raw = await _mysql_kv_get(database, REMOTE_STATE_KEY)
+            if raw:
+                data = json.loads(raw)
+                local = DATA_FILE.with_suffix(".tmp")
+                local.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                local.replace(DATA_FILE)
+                _reset_state_memory()
+                await load_state()
+            DB_GATE.update(active=False, connected=True, error="",
+                           last_sync=datetime.now().strftime("%H:%M:%S"))
+            if not raw:
+                await _save_state_now()
+        except _MySQLError as exc:
+            _db_boot_clear()
+            await _mysql_pool_close()
+            DB_GATE.update(active=True, configured=False, mode="", url="", database="")
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception:
+            _db_boot_clear()
+            await _mysql_pool_close()
+            DB_GATE.update(active=True, configured=False, mode="", url="", database="")
+            raise HTTPException(status_code=400, detail="دیتای روی سرور قابل خواندن نیست")
+        log_activity("system", f"پنل مستقیماً به MySQL متصل شد ({database} روی {host})", "ok")
+        await _db_unlock_bringup()
+        return {"ok": True, "base": _admin_base(), "database": database}
+
+    # ── manager mode (data-server-manager HTTP API) ──
+    database = str(body.get("database") or "").strip()
+    api_key = str(body.get("api_key") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", database):
+        raise HTTPException(status_code=400, detail="نام دیتابیس فقط حروف، عدد و زیرخط است")
+    if not re.fullmatch(r"[A-Za-z0-9]{40,128}", api_key):
+        raise HTTPException(status_code=400, detail="API key معتبر نیست")
+    try:
+        url = _db_parse_server(str(body.get("ipserver") or ""))
+    except _DbError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        await _db_ping(url, database, api_key)
+    except _DbError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    _db_boot_save(url, database, api_key)
+    DB_GATE.update(url=url, database=database, mode="manager", configured=True)
+    try:
+        raw = await _db_get(url, database, api_key, REMOTE_STATE_KEY)
+        if raw:
+            data = json.loads(raw)
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = DATA_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(DATA_FILE)
+            _reset_state_memory()
+            await load_state()
+        DB_GATE.update(active=False, connected=True, error="",
+                       last_sync=datetime.now().strftime("%H:%M:%S"))
+        if not raw:
+            await _save_state_now()
+    except _DbError as exc:
+        DB_GATE.update(active=True, connected=False, error=str(exc))
+        _db_boot_clear()
+        DB_GATE.update(url="", database="", configured=False, mode="")
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        DB_GATE.update(active=True, connected=False, error="دیتای سرور داده قابل خواندن نیست")
+        _db_boot_clear()
+        DB_GATE.update(url="", database="", configured=False, mode="")
+        raise HTTPException(status_code=400, detail="دیتای روی سرور داده قابل خواندن نیست")
+    log_activity("system", f"پنل به سرور داده متصل شد ({database})", "ok")
+    # Bring the data plane up now that state is available.
+    try:
+        await _ensure_xray()
+        if _xray_bin_path().exists():
+            await _xray_apply()
+    except Exception as exc:
+        logger.warning("Xray start after db-setup failed: %s", exc)
+    await _db_unlock_bringup()
     return {"ok": True, "base": _admin_base()}
 
 
@@ -1330,22 +1641,24 @@ async def api_db_setup(request: Request):
 async def api_db_status():
     """Public diagnostics for the data-server connection (no secrets)."""
     return {"ok": True, "active": DB_GATE["active"], "configured": DB_GATE["configured"],
-            "database": DB_GATE["database"], "connected": DB_GATE["connected"],
+            "mode": DB_GATE.get("mode") or "", "database": DB_GATE["database"],
+            "connected": DB_GATE["connected"],
             "error": DB_GATE["error"], "last_sync": DB_GATE["last_sync"]}
 
 
 @app.get("/api/db-info")
 async def api_db_info(_=Depends(require_auth)):
     return {"ok": True, "database": DB_GATE["database"], "url": DB_GATE["url"],
-            "connected": DB_GATE["connected"], "last_sync": DB_GATE["last_sync"],
-            "error": DB_GATE["error"]}
+            "mode": DB_GATE.get("mode") or "", "connected": DB_GATE["connected"],
+            "last_sync": DB_GATE["last_sync"], "error": DB_GATE["error"]}
 
 
 @app.post("/api/db-unlink")
 async def api_db_unlink(_=Depends(require_auth)):
     """Disconnect from the data server → panel locks until re-connected."""
     _db_boot_clear()
-    DB_GATE.update(active=True, configured=False, url="", database="",
+    await _mysql_pool_close()
+    DB_GATE.update(active=True, configured=False, url="", database="", mode="",
                    connected=False, error="", last_sync="")
     DB_GATE["gate_base"] = _admin_base()
     log_activity("system", "اتصال به سرور داده قطع شد — پنل قفل شد", "err")
