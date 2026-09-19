@@ -89,11 +89,7 @@ def _cfg() -> dict:
         "۲) استفاده از ترافیک برای فعالیت‌های غیرقانونی ممنوع است.\n"
         "۳) با ادامه استفاده، این قوانین را می‌پذیرید."
     ))
-    b.setdefault("support_text", (
-        "🛟 <b>بخش پشتیبانی</b>\n\n"
-        "برای دریافت پشتیبانی، به آیدی زیر پیام دهید:\n"
-        "@spider_vpn1"
-    ))
+    b.setdefault("support_text", "")
     b.setdefault("card_number", "")
     b.setdefault("card_owner", "")
     b.setdefault("min_charge", 50000)
@@ -324,11 +320,10 @@ def _usage_bar(pct: float, width: int = 12) -> str:
 async def _sub_report(user: dict) -> dict:
     """Build the subscription report for a user."""
     cuuid = user.get("config_uuid") or ""
-    host = P.SETTINGS.get("domain") or P.get_host()
     try:
-        sub_url = P.get_bot_sub_link(cuuid) or f"https://{host}/link/{cuuid}"
+        sub_url = P.get_bot_sub_link(cuuid) or P.sub_hash_url(cuuid) or ""
     except Exception:
-        sub_url = f"https://{host}/link/{cuuid}"
+        sub_url = P.sub_hash_url(cuuid) or ""
     data = await P._build_subscription_data_by_uuid(cuuid)
     configs = data.get("configs") or []
     vless = data.get("vless_link") or data.get("config") or (configs[0] if configs else "")
@@ -1425,9 +1420,9 @@ async def _cmd_add_direct(chat_id, args):
         await _send(chat_id, f"✅ کاربر <b>{_html(name)}</b> با {gb_f:g}GB و {d_i} روز ساخته شد.")
         await _send_sub(chat_id, user, with_qr=True)
     else:
-        host = P.SETTINGS.get("domain") or P.get_host()
-        await _send(chat_id, f"⚠️ این تلگرام از قبل کاربر <b>{_html(user.get('username'))}</b> را دارد.\n"
-                             f"ساب: https://{host}/link/{user.get('config_uuid')}")
+        _sub = P.get_bot_sub_link(user.get("config_uuid") or "") or P.sub_hash_url(user.get("config_uuid") or "")
+        extra = f"\nساب: <code>{_html(_sub)}</code>" if _sub else ""
+        await _send(chat_id, f"⚠️ این تلگرام از قبل کاربر <b>{_html(user.get('username'))}</b> را دارد.{extra}")
 
 
 async def _cmd_toggle(chat_id, args):

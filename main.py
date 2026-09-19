@@ -559,11 +559,7 @@ SETTINGS = {
             "۲) استفاده از ترافیک برای فعالیت‌های غیرقانونی ممنوع است.\n"
             "۳) با ادامه استفاده، این قوانین را می‌پذیرید."
         ),
-        "support_text": (
-            "🛟 <b>بخش پشتیبانی</b>\n\n"
-            "برای دریافت پشتیبانی، به آیدی زیر پیام دهید:\n"
-            "@spider_vpn1"
-        ),
+        "support_text": "",
         "card_number": "",
         "card_owner": "",
         "min_charge": 50000,
@@ -2223,8 +2219,6 @@ _SETTINGS_TOOLS = """
 
 @app.middleware("http")
 async def deployment_ui_fixes(request: Request, call_next):
-    if request.url.path == "/":
-        return RedirectResponse("/spider", status_code=307)
     response = await call_next(request)
     content_type = response.headers.get("content-type", "")
     if "text/html" not in content_type:
@@ -2486,11 +2480,7 @@ class MTProtoProxyServer:
 TGProxy = MTProtoProxyServer
 
 
-@app.get("/")
-async def root():
-    return {"service": "Spider Gateway", "version": "9.2", "status": "active", "channel": "https://t.me/spider_vpn1"}
-
-# ── Public subscription endpoint (link/uuid) ────────────────────────────────
+# ── User lookup helper ────────────────────────────────
 async def _find_user_by_config_uuid(config_uuid: str):
     async with USERS_LOCK:
         for uid, u in USERS.items():
@@ -2671,40 +2661,6 @@ async def _build_subscription_data_by_uuid(config_uuid: str):
     }
 
 
-@app.get("/link/{uuid}")
-async def link_page(uuid: str, request: Request):
-    """Single public subscription URL.
-
-    Browser requests receive the graphical subscription page. Non-browser
-    subscription clients receive the base64-encoded subscription payload.
-    The public identifier is UUID-only; username URLs are not supported.
-    """
-    data = await _build_subscription_data_by_uuid(uuid)
-    accept = (request.headers.get("accept") or "").lower()
-    user_agent = (request.headers.get("user-agent") or "").lower()
-
-    wants_html = (
-        "text/html" in accept
-        or "application/xhtml+xml" in accept
-        or "mozilla" in user_agent
-    )
-
-    if wants_html:
-        return FileResponse(_os.path.join(_STATIC_DIR, "sub.html"))
-
-    content = base64.b64encode("\n".join(data["configs"]).encode()).decode()
-    username = data.get("username") or uuid
-    return Response(
-        content=content,
-        media_type="text/plain",
-        headers={
-            "profile-title": quote(username),
-            "profile-update-interval": "12",
-            "support-url": "https://t.me/spider_vpn1",
-        },
-    )
-
-
 @app.get("/sub-all")
 async def subscription_all(_=Depends(require_auth)):
     import base64
@@ -2861,7 +2817,6 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         media_type="text/plain",
         headers={
             "profile-title": quote(sub["name"]),
-            "support-url": "https://t.me/spider_vpn1",
             "profile-update-interval": "12",
         }
     )
@@ -3065,6 +3020,26 @@ def get_bot_sub_link(config_uuid: str) -> str:
         return ""
     host = SETTINGS.get("domain") or get_host()
     return f"https://{host}/sub/{h}"
+
+
+def sub_hash_url(config_uuid: str, host: str = "") -> str:
+    """Canonical public subscription URL: /sub/{random-hash}.
+
+    The hash is an unguessable random token (created once per user, persisted
+    in state) — it never contains the username or any UUID. Returns "" when no
+    hash can be produced; callers keep the field empty rather than falling back
+    to a guessable identifier.
+    """
+    try:
+        if not config_uuid:
+            return ""
+        h = ensure_sub_hash(str(config_uuid))
+        if not h:
+            return ""
+        host = host or (SETTINGS.get("domain") or get_host())
+        return f"https://{host}/sub/{h}"
+    except Exception:
+        return ""
 
 
 # ── Config output cache (mirrors configOutputCache*) ─────────────────────────
@@ -3568,86 +3543,10 @@ _PORTAL_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
-    "Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    "Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
     "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
 }
 
-_SUB_PORTAL_PAGE = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>اشتراک — SpiderPanel</title><style>
-:root{--bg:#000;--card:#0d0d12;--line:#1e1e26;--accent:#00e1c1;--txt:#f4f4f5;--muted:#8b8b96}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:radial-gradient(1200px 600px at 80% -10%,#062823,transparent),radial-gradient(900px 500px at 10% 110%,#0b1d1d,transparent),var(--bg);color:var(--txt);
-font-family:-apple-system,Segoe UI,Tahoma,Vazirmatn,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.card{width:100%;max-width:460px;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:26px}
-h1{font-size:18px;margin-bottom:4px}.sub{color:var(--muted);font-size:13px;margin-bottom:18px}
-.brand{color:var(--accent);font-weight:800;font-size:16px;text-align:center;margin-bottom:18px}
-.stat{display:flex;justify-content:space-between;font-size:14px;padding:8px 0;border-bottom:1px solid var(--line)}
-.stat b{color:var(--accent)}
-.bar{height:8px;background:#1b1b22;border-radius:99px;overflow:hidden;margin:12px 0 6px}
-.bar i{display:block;height:100%;background:linear-gradient(90deg,#00e1c1,#00c9a9);border-radius:99px}
-.link{width:100%;margin-top:14px;padding:11px;background:#08080b;border:1px solid var(--line);border-radius:12px;
-font-family:ui-monospace,monospace;font-size:11px;direction:ltr;text-align:left;color:var(--txt);word-break:break-all}
-.link small{display:block;color:var(--muted);font-family:inherit;font-size:10px;margin-bottom:4px;direction:rtl;text-align:right}
-.btn{display:block;width:100%;margin-top:10px;padding:12px;border-radius:12px;border:0;background:#14141c;color:var(--txt);
-font-size:14px;cursor:pointer;font-family:inherit}
-.btn.p{background:var(--accent);color:#00261f;font-weight:700}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.err{padding:60px 20px;text-align:center}
-.err h1{font-size:60px;color:var(--accent)}</style></head><body><div class="card" id="app">
-<div class="brand">SVPN</div><div id="body"><div class="err">لطفاً صبر کنید…</div></div></div>
-<script>
-var HASH=location.pathname.split('/').filter(Boolean).pop();
-var apiUrl='/api/subscription/'+HASH;
-function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-function flash(m){var d=document.getElementById('toast');if(!d)return;d.textContent=m;d.style.opacity=1;setTimeout(function(){d.style.opacity=0},1200)}
-function copy(t){if(navigator.clipboard)navigator.clipboard.writeText(t).then(function(){flash('کپی شد ✓')});else flash('کپی شد ✓')}
-fetch(apiUrl).then(function(r){if(!r.ok)throw new Error(r.status);return r.json()}).then(function(d){
-var used=(d.usage&&d.usage.usedBytes)||0,lim=(d.usage&&d.usage.limitBytes)||0;
-var unlim=!!(d.usage&&d.usage.unlimited);
-var pct=unlim?0:Math.min(100,(used/(lim||1))*100);
-var subU='https://'+location.host+'/sub/'+HASH;
-var rawU=subU+'?format=raw',clashU=subU+'?format=clash',singU=subU+'?format=singbox',vjsonU=subU+'?format=vjson';
-var totalTxt=unlim?'نامحدود':(Math.round(lim/1073741824*100)/100+' GB');
-var usedTxt=Math.round(used/1073741824*100)/100+' GB';
-var rem=(d.expiry&&!d.expiry.unlimited)?new Date(d.expiry.ms).toLocaleDateString('fa-IR'):'نامحدود';
-var status=d.status||'active';
-var stTxt=status==='active'?'فعال':(status==='paused'?'متوقف':'منقضی');
-var stColor=status==='active'?'#00e1c1':(status==='paused'?'#f5a623':'#f55');
-var rows='';
-rows+='<div class="stat"><span>نام کاربری</span><b>'+esc(d.user&&d.user.name||'کاربر')+'</b></div>';
-rows+='<div class="stat"><span>وضعیت</span><b style="color:'+stColor+'">'+stTxt+'</b></div>';
-rows+='<div class="stat"><span>مصرف شده</span><b>'+usedTxt+'</b></div>';
-rows+='<div class="stat"><span>حجم کل</span><b>'+totalTxt+'</b></div>';
-rows+='<div class="stat"><span>انقضا</span><b>'+rem+'</b></div>';
-rows+='<div class="bar"><i style="width:'+pct+'%"></i></div><div class="stat"><span>'+(pct.toFixed(0))+'٪ استفاده</span><b></b></div>';
-var links='';
-links+='<div class="link"><small>Auto-Detect · Hiddify · v2rayNG · Streisand</small>'+subU+'</div>';
-links+='<div class="link"><small>V2Ray / Universal (Base64)</small>'+rawU+'</div>';
-links+='<div class="link"><small>Clash / Meta / Mihomo</small>'+clashU+'</div>';
-links+='<div class="link"><small>Sing-Box / Hiddify / Karing</small>'+singU+'</div>';
-links+='<div class="link"><small>v2rayN JSON</small>'+vjsonU+'</div>';
-document.getElementById('body').innerHTML=
-'<div id="toast" style="position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:9;background:#0d0d12;border:1px solid #00e1c1;color:#00e1c1;padding:8px 16px;border-radius:99px;font-size:12px;opacity:0;transition:.3s"></div>'+
-rows+
-'<button class="btn p" id="c0">📋 کپی لینک سابسکریپشن</button>'+
-'<div class="row">'+
-'<button class="btn" id="i0">وارد کردن در Hiddify</button>'+
-'<button class="btn" id="i1">وارد کردن در v2rayNG</button>'+
-'</div>'+
-'<div class="row">'+
-'<button class="btn" id="i2">👑 Clash Meta</button>'+
-'<button class="btn" id="i3">📦 Sing-box</button>'+
-'</div>'+links;
-document.getElementById('c0').onclick=function(){copy(subU)};
-document.getElementById('i0').onclick=function(){location.href='hiddify://import/'+rawU};
-document.getElementById('i1').onclick=function(){location.href='v2rayng://install-config?url='+encodeURIComponent(rawU)};
-document.getElementById('i2').onclick=function(){location.href='clash://install-config?url='+encodeURIComponent(clashU)};
-document.getElementById('i3').onclick=function(){copy(singU)};
-}).catch(function(e){
-document.getElementById('body').innerHTML='<div class="err"><h1>404</h1><div>لینک نامعتبر یا منقضی است.</div></div>';
-});
-</script></body></html>"""
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -3686,7 +3585,10 @@ async def hashed_sub_route(sub_hash: str, request: Request):
     wants_portal = (request.query_params.get("view") == "1"
                     or (not forced_flag and client_type == "browser" and "text/html" in accept))
     if wants_portal:
-        return HTMLResponse(content=_SUB_PORTAL_PAGE, headers=_PORTAL_HEADERS)
+        resp = _serve_html("sub.html", headers=_PORTAL_HEADERS)
+        for _k, _v in _PORTAL_HEADERS.items():
+            resp.headers.setdefault(_k, _v)
+        return resp
 
     effective_flag = forced_flag or ("clash" if client_type == "clash" else "singbox" if client_type == "singbox" else "raw")
     allow_insecure = any(request.query_params.get(k) in ("true", "1")
@@ -4197,7 +4099,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         **LINKS[uid],
         "expired": False,
         "vless_link": generate_vless_link(uid, host, remark=f"Spider-{label}", protocol=protocol),
-        "sub_url": f"https://{host}/link/{uid}",
+        "sub_url": sub_hash_url(uid),
     }
 
 @app.get("/api/links")
@@ -4214,7 +4116,7 @@ async def list_links(_=Depends(require_auth)):
             "protocol": proto,
             "expired": is_link_expired(d),
             "vless_link": generate_vless_link(uid, host, remark=f"Spider-{d['label']}", protocol=proto),
-            "sub_url": f"https://{host}/link/{uid}",
+            "sub_url": sub_hash_url(uid),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -4851,7 +4753,7 @@ async def list_users(_=Depends(require_auth)):
             "inbound_name": INBOUNDS.get(u.get("inbound_id", ""), {}).get("name", "") if u.get("inbound_id") else "",
             "config_url": f"https://{host}/api/users/{uid}/config",
             "qr_url": f"https://{host}/api/users/{uid}/qr",
-            "subscription_url": f"https://{host}/link/{u.get('config_uuid')}",
+            "subscription_url": sub_hash_url(u.get('config_uuid')),
             "connections": sum(1 for c in connections.values() if c.get("uuid") == u.get("config_uuid")),
             "node_configs": dict(u.get("node_configs") or {}),
             "node_sync_state": dict(u.get("node_sync_state") or {}),
@@ -5235,7 +5137,7 @@ async def create_user(request: Request, auth=Depends(require_replication_auth)):
         "password_hash": None,
         "config_url": f"https://{host}/api/users/{user_id}/config",
         "qr_url": f"https://{host}/api/users/{user_id}/qr",
-        "subscription_url": f"https://{host}/link/{USERS[user_id].get('config_uuid')}",
+        "subscription_url": sub_hash_url(USERS[user_id].get('config_uuid')),
         "config": generate_user_config(user_id, USERS[user_id], inbound_id),
     }
 
@@ -5432,7 +5334,7 @@ async def get_user(user_id: str, auth=Depends(require_replication_auth)):
     u["config"] = generate_user_config(target_id, u, u.get("inbound_id"))
     u["config_url"] = f"https://{host}/api/users/{target_id}/config"
     u["qr_url"] = f"https://{host}/api/users/{target_id}/qr"
-    u["subscription_url"] = f"https://{host}/link/{u.get('config_uuid')}"
+    u["subscription_url"] = sub_hash_url(u.get('config_uuid'))
     u["traffic_used_fmt"] = fmt_bytes(u.get("traffic_used_bytes", 0))
     u["traffic_limit_fmt"] = "∞" if u.get("traffic_limit_bytes", 0) == 0 else fmt_bytes(u.get("traffic_limit_bytes", 0))
     return u
@@ -5516,12 +5418,12 @@ async def get_user_config(user_id: str, _=Depends(require_auth)):
         "config": config,
         "config_url": f"https://{host}/api/users/{user_id}/config",
         "qr_url": f"https://{host}/api/users/{user_id}/qr",
-        "subscription_url": f"https://{host}/link/{u.get('config_uuid')}",
+        "subscription_url": sub_hash_url(u.get('config_uuid')),
     }
 
 @app.get("/api/users/{user_id}/qr")
 async def get_user_qr(user_id: str, _=Depends(require_auth)):
-    """Return a QR code PNG for the user's subscription URL (domain/link/uuid)."""
+    """Return a QR code PNG for the user's hashed subscription URL."""
     if not QR_AVAILABLE:
         raise HTTPException(status_code=501, detail="QR code generation not available (install qrcode and Pillow)")
 
@@ -5536,7 +5438,7 @@ async def get_user_qr(user_id: str, _=Depends(require_auth)):
         raise HTTPException(status_code=404, detail="user has no config_uuid")
 
     host = SETTINGS.get("domain") or get_host()
-    sub_url = f"https://{host}/link/{config_uuid}"
+    sub_url = sub_hash_url(config_uuid, host)
 
     qr = qrcode.QRCode(version=1, box_size=10, border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
     qr.add_data(sub_url)
@@ -5582,7 +5484,7 @@ async def get_user_subscription(user_id: str, _=Depends(require_auth)):
         "user_id": user_id,
         "username": username,
         "subscription_uuid": sub_uuid,
-        "subscription_url": f"https://{host}/link/{sub_uuid}",
+        "subscription_url": sub_hash_url(sub_uuid),
         "encoded_config": content,
         "configs": configs,
     }
@@ -5638,7 +5540,7 @@ async def public_sub_data(uuid_key: str, request: Request):
             "limit_fmt": "∞" if link.get("limit_bytes", 0) == 0 else fmt_bytes(link["limit_bytes"]),
             "expires_at": link.get("expires_at"),
             "vless_link": generate_vless_link(lid, host, remark=f"Spider-{link['label']}", protocol=proto),
-            "sub_url": f"https://{host}/link/{lid}",
+            "sub_url": sub_hash_url(lid),
             "connections": conn_count,
         })
 
@@ -5662,26 +5564,6 @@ _os.makedirs(_STATIC_DIR, exist_ok=True)
 # the panel music + background images 404'd.
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
-@app.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request):
-    if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse(url="/spider")
-    return FileResponse(_os.path.join(_STATIC_DIR, "login.html"))
-
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_redirect(request: Request):
-    return RedirectResponse(url="/spider")
-
-@app.get("/spider", response_class=HTMLResponse)
-async def spider_panel(request: Request):
-    if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse(url="/login")
-    await ensure_default_link()
-    return FileResponse(_os.path.join(_STATIC_DIR, "index.html"))
-
-@app.get("/test-ws", response_class=HTMLResponse)
-async def test_ws_redirect():
-    return HTMLResponse(content="<script>location.href='/spider'</script>")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5689,14 +5571,45 @@ async def test_ws_redirect():
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/sub/{uuid_key}")
-async def api_user_sub(uuid_key: str):
-    """Return public subscription data by config UUID only."""
+async def api_user_sub(uuid_key: str, _=Depends(require_auth)):
+    """Subscription data by config UUID (admin-authenticated only)."""
     return await _build_subscription_data_by_uuid(uuid_key)
 
 
+@app.get("/api/sub-by-hash/{sub_hash}")
+async def api_sub_by_hash(sub_hash: str):
+    """Subscription data by unguessable hash — the public API sub.html uses.
+
+    The hash itself is the secret; knowing it is the only requirement.
+    """
+    rec = validate_sub_hash(sub_hash)
+    if rec is None or rec.get("revoked"):
+        raise HTTPException(status_code=404, detail="subscription not found")
+    try:
+        return await _build_subscription_data_by_uuid(rec["config_uuid"])
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="subscription not found")
+
+
+@app.get("/api/sub-link/{user_id}")
+async def api_sub_link(user_id: str, _=Depends(require_auth)):
+    """Admin-only: the canonical hashed subscription URL for a user."""
+    _uid, u = await _find_user_by_config_uuid(user_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="user not found")
+    cu = str(u.get("config_uuid") or "")
+    if not cu:
+        raise HTTPException(status_code=404, detail="user not found")
+    url = sub_hash_url(cu)
+    if not url:
+        raise HTTPException(status_code=500, detail="could not create subscription link")
+    asyncio.create_task(save_state())
+    return {"ok": True, "url": url, "hash": url.rsplit("/", 1)[-1]}
+
+
 @app.get("/api/sub/{uuid_key}/qr")
-async def sub_qr(uuid_key: str, cfg: str = ""):
-    """Public QR code for a UUID-only subscription."""
+async def sub_qr(uuid_key: str, cfg: str = "", _=Depends(require_auth)):
+    """QR code for a subscription (admin-authenticated only)."""
     if not QR_AVAILABLE:
         raise HTTPException(status_code=501, detail="qr code generation not available")
 
@@ -5705,9 +5618,9 @@ async def sub_qr(uuid_key: str, cfg: str = ""):
         raise HTTPException(status_code=404, detail="subscription not found")
 
     configs_data = await _build_subscription_data_by_uuid(uuid_key)
-    qr_data = f"{SETTINGS.get('domain') or get_host()}/link/{uuid_key}"
+    qr_data = sub_hash_url(uuid_key)
     if cfg and cfg == uuid_key:
-        qr_data = f"https://{SETTINGS.get('domain') or get_host()}/link/{uuid_key}"
+        qr_data = sub_hash_url(uuid_key)
     elif cfg and cfg.isdigit():
         idx = int(cfg)
         real_cfgs = [c for c in configs_data.get("configs", []) if c and "%F0%9F%93%8A" not in c]
@@ -9855,6 +9768,162 @@ async def scanner_sni_fastest(_=Depends(require_auth)):
 # ══════════════════════════════════════════════════════════════════════════════
 
 # (removed dead proxy-ips endpoints — proxy source is now the daily GitHub list)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECRET ADMIN PATH + PRETTY 404  (registered last — matches only unknown GETs)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ADMIN_PATH_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_ADMIN_RESERVED = {"api", "static", "sub", "sub-all", "link", "ws", "proxy",
+                   "tunnel", "reverse", "health", "favicon.ico", "assets"}
+
+
+def _validate_admin_path(raw) -> str:
+    """Return '' (reset to default) or a validated path like /my/secret/login."""
+    p = str(raw or "").strip().lower()
+    if not p:
+        return ""
+    if not p.startswith("/"):
+        p = "/" + p
+    p = re.sub(r"/{2,}", "/", p).rstrip("/")
+    if p in ("", "/"):
+        return ""
+    if len(p) > 200:
+        raise HTTPException(status_code=400, detail="مسیر بیش از حد طولانی است")
+    segs = [s for s in p.split("/") if s]
+    if not segs or any(not _ADMIN_PATH_RE.fullmatch(s) for s in segs):
+        raise HTTPException(status_code=400,
+                            detail="فقط حروف انگلیسی، عدد، خط تیره و زیرخط مجاز است")
+    if segs[0] in _ADMIN_RESERVED:
+        raise HTTPException(status_code=400,
+                            detail="این مسیر رزرو شده است؛ مسیر دیگری انتخاب کنید")
+    return p
+
+
+def _admin_base() -> str:
+    """Current admin UI base path (default: /spider). Never leaks elsewhere."""
+    try:
+        return _validate_admin_path(SETTINGS.get("admin_path") or "") or "/spider"
+    except HTTPException:
+        return "/spider"
+
+
+def _serve_html(filename: str, headers: dict | None = None) -> HTMLResponse:
+    """Serve a static panel page with the ADMIN_BASE bootstrap injected."""
+    path = _os.path.join(_STATIC_DIR, filename)
+    try:
+        with open(path, encoding="utf-8") as f:
+            html = f.read()
+    except Exception:
+        raise HTTPException(status_code=500, detail="panel file missing")
+    base = _admin_base()
+    boot = ("<script>window.ADMIN_BASE=" + json.dumps(base)
+            + ";window.ADMIN_LOGIN=" + json.dumps(base + "/login") + ";</script>")
+    if "<head>" in html:
+        html = html.replace("<head>", "<head>" + boot, 1)
+    else:
+        html = boot + html
+    return HTMLResponse(content=html, headers=headers or {})
+
+
+@app.post("/api/settings/admin-path")
+async def api_set_admin_path(request: Request, _=Depends(require_auth)):
+    """Change the secret admin login path. Empty path resets to the default."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad request")
+    new_path = _validate_admin_path(body.get("path"))
+    async with SETTINGS_LOCK:
+        SETTINGS["admin_path"] = new_path
+    asyncio.create_task(save_state())
+    log_activity("system",
+                 f"مسیر ورود مدیریت تغییر کرد → {new_path or '/spider (پیش‌فرض)'}", "ok")
+    return {"ok": True, "admin_path": new_path, "base": _admin_base()}
+
+
+_NOT_FOUND_PAGE = """<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>404 — صفحه پیدا نشد</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
+background:radial-gradient(900px 500px at 85% -10%,rgba(0,225,193,.09),transparent 60%),
+radial-gradient(700px 420px at 8% 110%,rgba(0,225,193,.06),transparent 60%),#050507;
+color:#f4f4f5;font-family:Vazirmatn,-apple-system,'Segoe UI',Tahoma,sans-serif}
+.card{text-align:center;max-width:430px;width:100%;border:1px solid #1c1c24;border-radius:24px;
+background:rgba(13,13,18,.85);backdrop-filter:blur(10px);padding:44px 30px 38px;
+box-shadow:0 30px 80px rgba(0,0,0,.55)}
+.spider{width:88px;height:88px;margin:0 auto 6px;display:block;color:#00e1c1;
+filter:drop-shadow(0 0 18px rgba(0,225,193,.35))}
+.code{font-size:74px;font-weight:800;letter-spacing:.08em;line-height:1.15;color:#00e1c1;
+text-shadow:0 0 40px rgba(0,225,193,.28);direction:ltr}
+h1{font-size:19px;margin:14px 0 8px;font-weight:700}
+p{color:#8b8b96;font-size:14px;margin:0 0 28px;line-height:2}
+.btn{display:inline-flex;align-items:center;gap:8px;border:0;cursor:pointer;text-decoration:none;
+color:#04110e;background:#00e1c1;padding:11px 26px;border-radius:12px;font-weight:700;font-size:14px;
+font-family:inherit;transition:filter .2s,transform .2s}
+.btn:hover{filter:brightness(1.1);transform:translateY(-1px)}
+.hint{margin-top:22px;font-size:12px;color:#5c5c66;direction:ltr}
+</style>
+</head>
+<body>
+<div class="card">
+<svg class="spider" viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round">
+  <ellipse cx="50" cy="58" rx="13" ry="16" fill="currentColor" stroke="none"/>
+  <circle cx="50" cy="36" r="8.5" fill="currentColor" stroke="none"/>
+  <path d="M40 40 Q22 30 14 12"/><path d="M60 40 Q78 30 86 12"/>
+  <path d="M37 52 Q14 46 6 30"/><path d="M63 52 Q86 46 94 30"/>
+  <path d="M37 64 Q12 66 4 82"/><path d="M63 64 Q88 66 96 82"/>
+  <path d="M42 74 Q30 88 24 96"/><path d="M58 74 Q70 88 76 96"/>
+</svg>
+<div class="code">404</div>
+<h1>این صفحه وجود ندارد</h1>
+<p>نشانی‌ای که باز کرده‌اید اشتباه است یا دیگر در دسترس نیست.</p>
+<button class="btn" onclick="history.back()">بازگشت</button>
+<div class="hint">404 &middot; Not Found</div>
+</div>
+</body>
+</html>
+"""
+
+
+@app.exception_handler(404)
+async def pretty_404_handler(request: Request, exc):
+    """Pretty HTML 404 for pages, JSON for APIs — every unknown route covered."""
+    p = request.url.path or "/"
+    if p.startswith("/api/") or p.startswith("/ws/"):
+        detail = getattr(exc, "detail", None) or "Not Found"
+        return JSONResponse(status_code=404, content={"detail": detail})
+    return HTMLResponse(content=_NOT_FOUND_PAGE, status_code=404)
+
+
+@app.get("/{page_path:path}", include_in_schema=False)
+async def admin_gate(request: Request, page_path: str = ""):
+    """Single catch-all serving the admin UI under its configurable secret path.
+
+    Anything that reaches here (and is not the configured admin path) raises
+    404 → the pretty not-found page. The old /login, /dashboard, /test-ws and
+    any previously-configured custom path stop existing immediately.
+    """
+    p = "/" + (page_path or "").strip("/")
+    base = _admin_base()
+    if p == base:
+        if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
+            await ensure_default_link()
+            return _serve_html("index.html")
+        return RedirectResponse(url=base + "/login", status_code=307)
+    if p == base + "/login":
+        if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
+            return RedirectResponse(url=base, status_code=307)
+        return _serve_html("login.html")
+    raise HTTPException(status_code=404)
 
 
 if __name__ == "__main__":

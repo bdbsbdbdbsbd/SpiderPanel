@@ -82,7 +82,6 @@ html, body {
 [data-theme="light"] .sidebar,
 [data-theme="light"] .topbar,
 [data-theme="light"] .modal-c,
-[data-theme="light"] .contact-bubble,
 [data-theme="light"] .login-card{background:#ffffff}
 [data-theme="light"] .f-g input,[data-theme="light"] .f-g select,[data-theme="light"] .f-g textarea,
 [data-theme="light"] .input-glass{background:#ffffff;color:#000000;border-color:rgba(0,0,0,.16)}
@@ -512,8 +511,8 @@ input,select,button,textarea{font-family:inherit}
 .tab-content{flex:1;display:flex;flex-direction:column;min-height:0;}
 .tab-content.hidden{display:none!important}
 .tab-content:not(.hidden){display:flex;flex-direction:column;position:static!important;top:auto!important;right:auto!important;bottom:auto!important;left:auto!important;transform:none!important;width:100%;margin-top:0!important;align-self:stretch;}
-/* Settings / Contact must always start at the top of the content area. */
-#tab-settings,#tab-contact{
+/* Settings must always start at the top of the content area. */
+#tab-settings{
   position:static!important;top:0!important;right:auto!important;bottom:auto!important;left:auto!important;
   transform:none!important;width:100%!important;margin:0!important;padding:0!important;
   align-self:flex-start!important;flex:none!important;min-height:0!important;height:auto!important;
@@ -521,14 +520,12 @@ input,select,button,textarea{font-family:inherit}
   justify-content:flex-start!important;align-items:stretch!important;
   scroll-margin-top:0!important;overflow-anchor:none!important;
 }
-#tab-settings.hidden,#tab-settings.hidden,#tab-contact.hidden{display:none!important;}
-#tab-settings>.panel,#tab-settings>.panel,#tab-contact>.panel{
+#tab-settings.hidden{display:none!important;}
+#tab-settings>.panel{
   display:block!important;box-sizing:border-box!important;float:none!important;position:static!important;
   top:auto!important;bottom:auto!important;transform:none!important;
   margin:0 0 14px 0!important;max-height:none!important;overflow:visible!important;
 }
-#tab-contact .panel:first-child{margin-top:0!important;}
-#tab-contact .contact-panel{height:auto!important;min-height:0!important;max-height:none!important;}
 .content{justify-content:flex-start!important;align-items:stretch!important;overflow-anchor:none!important;scroll-padding-top:0!important;}
 
 /* LTR (English) adjustments — iOS system font */
@@ -825,36 +822,6 @@ tr{animation:fadeIn .3s ease}
 .theme-dot.active{border-color:var(--neon);box-shadow:0 0 12px var(--neon)}
 .theme-dot.red{background:#ff1744}.theme-dot.green{background:#00ff41}.theme-dot.blue{background:#448aff}
 
-/* Contact Me bubbles */
-.contact-panel{text-align:center;display:flex;flex-direction:column;align-items:center;gap:6px;justify-content:flex-start;min-height:auto;width:100%;height:100%}
-.contact-sub{font-size:12px;color:var(--txt2);margin-bottom:18px}
-.contact-bubbles{display:flex;gap:28px;justify-content:center;align-items:center;flex-wrap:wrap;padding:16px 0 8px;width:100%;align-self:flex-start}
-.contact-bubble{
-  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;
-  width:150px;height:150px;border-radius:50%;
-  background:#0a0a0d;
-  border:1.5px solid var(--border);color:var(--txt);text-decoration:none;
-  box-shadow:var(--shadow-md);transition:all .3s ease;position:relative;overflow:hidden;flex-shrink:0
-}
-.contact-bubble{
-  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;
-  width:150px;height:150px;border-radius:50%;
-  background:#0a0a0d;
-  border:1.5px solid var(--border);color:var(--txt);text-decoration:none;
-  box-shadow:var(--shadow-md);transition:all .3s ease;position:relative;overflow:hidden;
-}
-.contact-bubble::before{content:none}
-.contact-bubble svg{width:40px;height:40px;color:var(--neon);transition:transform .3s ease}
-.contact-bubble span{font-size:13px;font-weight:700}
-.contact-bubble small{font-size:10px;color:var(--txt2);direction:ltr}
-.contact-bubble:hover{transform:translateY(-6px);border-color:var(--border-glow);box-shadow:var(--shadow-lg)}
-.contact-bubble:hover svg{transform:scale(1.15)}
-.contact-bubble.tg:hover svg{color:#229ED9}
-.contact-bubble.gh:hover svg{color:#a5a5a5}
-.contact-bubble.yt:hover svg{color:#FF0000}
-.contact-bubble.tg::after{content:'';position:absolute;inset:0;border-radius:50%;background:radial-gradient(circle,rgba(34,158,217,.14),transparent 70%);opacity:0;transition:opacity .3s;pointer-events:none}
-.contact-bubble.gh::after{content:'';position:absolute;inset:0;border-radius:50%;background:radial-gradient(circle,rgba(148,148,148,.14),transparent 70%);opacity:0;transition:opacity .3s;pointer-events:none}
-.contact-bubble:hover::after{opacity:1}
 
 .hidden{display:none!important}
 
@@ -964,7 +931,7 @@ tr{animation:fadeIn .3s ease}
 [data-theme="light"] .country-tick.selected .ck{background:#000!important;color:#fff!important;border-color:#000!important}
 .country-tick .country-name{display:inline-block;line-height:1.2;white-space:nowrap}
 .panel-h .glow,.panel-h .glow *{color:var(--neon)!important;text-shadow:none!important}
-.stat-v,.stat-icon,.topbar-greet strong,.contact-bubble svg{color:var(--neon)!important}
+.stat-v,.stat-icon,.topbar-greet strong{color:var(--neon)!important}
 .settings-inner-block{padding-top:14px;margin-top:14px;border-top:1px solid var(--border)}
 .settings-inner-block:first-of-type{padding-top:0;margin-top:0;border-top:0}
 
@@ -1180,14 +1147,6 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
         </div>
       </div>
 
-      <div class="nav-item" onclick="switchTab('autoconfig',this)">
-        <span class="nav-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4m0 12v4M2 12h4m12 0h4"/><circle cx="12" cy="12" r="4"/></svg></span>
-        <span data-i18n="autoconfig">Auto Config</span>
-      </div>
-      <div class="nav-item" onclick="switchTab('contact',this)">
-        <span class="nav-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg></span>
-        <span data-i18n="contact">Contact Me</span>
-      </div>
       <div class="nav-item" onclick="doLogout()" style="color:var(--red)!important">
         <span class="nav-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4m7 14l5-5-5-5m5 5H9"/></svg></span>
         <span data-i18n="logout">خروج</span>
@@ -1410,8 +1369,17 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
             </form>
           </div>
           <div class="settings-inner-block">
+            <div class="panel-h"><span class="glow" data-i18n="adminPath">مسیر ورود مدیریت</span></div>
+            <div class="px-hint" data-i18n="adminPathHint"></div>
+            <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+              <input type="text" id="set-admin-path" dir="ltr" placeholder="/admin/login/sec/login" style="flex:1;min-width:220px" autocomplete="off">
+              <button class="btn btn-p" onclick="saveAdminPath()"><span data-i18n="adminPathBtn">ذخیره مسیر</span></button>
+              <button class="btn btn-g" onclick="resetAdminPath()"><span data-i18n="adminPathReset">بازگشت به پیش‌فرض</span></button>
+            </div>
+          </div>
+          <div class="settings-inner-block">
             <div class="panel-h"><span class="glow" data-i18n="panelUpdate">بروزرسانی پنل</span></div>
-            <div class="px-hint" data-i18n="panelUpdateHint">با زدن این دکمه، آخرین نسخه ریپو از GitHub دریافت و روی سرور نصب می‌شود (amirh00sain/SpiderPanel). بعد از اتمام، پنل را در Railway ری‌استارت/ری‌دپلوی کنید تا نسخه جدید اعمال شود.</div>
+            <div class="px-hint" data-i18n="panelUpdateHint">با زدن این دکمه، آخرین نسخه پنل از منبع رسمی دریافت و روی سرور نصب می‌شود. بعد از اتمام، پنل را ری‌استارت/ری‌دپلوی کنید تا نسخه جدید اعمال شود.</div>
             <button class="btn btn-p" style="width:100%;margin-top:10px" id="upd-btn" onclick="runPanelUpdate()"><span data-i18n="updatePanel">بروزرسانی</span></button>
             <pre id="upd-log" dir="ltr" style="display:none;margin-top:10px;padding:10px;border-radius:8px;background:var(--bg2,#111);color:var(--green);font-size:11px;max-height:220px;overflow-y:auto;white-space:pre-wrap;font-family:monospace"></pre>
           </div>
@@ -1430,27 +1398,6 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
         </div>
       </div>
 
-      <!-- AUTO CONFIG TAB -->
-      <div class="tab-content hidden" id="tab-autoconfig">
-        <div class="panel">
-          <div style="text-align:center;padding:30px 0 20px">
-            <button class="btn btn-p" id="ac-auto-btn" onclick="acStart()" style="font-size:16px;padding:14px 60px;border-radius:14px">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="vertical-align:-3px"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-              <span data-i18n="acAutoBtn">Auto</span>
-            </button>
-            <div class="px-hint" style="margin-top:12px" data-i18n="acHint">اسکن کامل خودکار: پینگ دامنه‌ها → انتخاب Railway/Cloudflare → اسکن IP → تست دامنه‌های TCP → اسکن SNI → پینگ نهایی پنل. همه مراحل با اینترنت خود شما انجام می‌شود.</div>
-          </div>
-          <!-- Step 0: domain input -->
-          <div class="f-g" id="ac-domain-wrap" style="display:flex;gap:8px">
-            <input type="text" id="ac-domain" dir="ltr" placeholder="your-panel.up.railway.app" style="flex:1">
-          </div>
-          <!-- Progress log -->
-          <div class="scn-list" id="ac-log" style="margin-top:12px;display:none"></div>
-          <!-- Results -->
-          <div id="ac-results" style="margin-top:12px"></div>
-        </div>
-      </div>
-
       <!-- NODES TAB -->
       <div class="tab-content hidden" id="tab-nodes">
         <div class="spd-acc" style="margin-bottom:10px">
@@ -1464,29 +1411,6 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
               <button class="btn btn-g" onclick="syncAllNodes()"><span data-i18n="syncAllNodes">همگام‌سازی همه</span></button>
             </div>
             <div id="nodes-list"></div>
-          </div>
-        </div>
-      </div>
-
-<!-- CONTACT TAB -->
-      <div class="tab-content hidden" id="tab-contact">
-        <div class="panel contact-panel">
-          <div class="panel-h"><span class="glow" data-i18n="contact">Contact Me</span></div>
-          <p class="contact-sub" data-i18n="contactSub">برای پشتیبانی و همکاری با من در ارتباط باشید</p>
-          <div class="contact-bubbles">
-            <a class="contact-bubble tg" href="https://t.me/amirspl1der" target="_blank" rel="noopener" title="Telegram">
-              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>
-            </a>
-            <a class="contact-bubble tg" href="https://t.me/SPiDER_VPN1" target="_blank" rel="noopener" title="Telegram">
-              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>
-            </a>
-            <a class="contact-bubble yt" href="https://www.youtube.com/@SPiDER_VPN1" target="_blank" rel="noopener" title="YouTube">
-              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
-            </a>
-            <a class="contact-bubble gh" href="https://github.com/amirh00sain/SpiderPanel" target="_blank" rel="noopener" title="GitHub">
-              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-.3.063-.61.095-.88.095-1.74 0-2.13-1.32-2.13-1.32-.285-.72-.695-1.313-1.238-1.673-.99-.675.06-.662.06-.662 1.08.06 1.65 1.065 1.65 1.065.96 1.65 2.52 1.173 3.135.897.097-.698.375-1.173.682-1.442-2.38-.27-4.875-1.19-4.875-5.31 0-1.173.42-2.133 1.11-2.883-.11-.27-.48-1.362.105-2.838 0 0 .907-.285 2.97 1.105.87-.24 1.8-.36 2.73-.36.93 0 1.86.12 2.73.36 2.06-1.39 2.97-1.105 2.97-1.105.586 1.476.216 2.568.105 2.838.69.75 1.11 1.71 1.11 2.883 0 4.13-2.5 5.035-4.885 5.31.385.33.72.98.72 1.975 0 1.425-.015 2.57-.015 2.92 0 .32.22.695.825.575C20.565 22.09 24 17.595 24 12.297 24 5.67 18.63.297 12 .297z"/></svg>
-              <span style="display:none">GitHub</span>
-            </a>
           </div>
         </div>
       </div>
@@ -1680,7 +1604,7 @@ var selectedTheme = localStorage.getItem('spider-theme') || 'dark';
 var LANG = localStorage.getItem('spider-lang') || 'fa';
 var I18N = {
   fa: {
-    'dash': 'داشبورد', 'navGroup': 'مدیریت', 'advanced': 'پیشرفته', 'networkTotal': 'مجموع ارسال + دریافت', 'users': 'کاربران', 'inbounds': 'اینباندها', 'scanner': 'اسکنر IP', 'settings': 'تنظیمات', 'contact': 'Contact Me', 'logout': 'خروج',
+    'dash': 'داشبورد', 'navGroup': 'مدیریت', 'advanced': 'پیشرفته', 'networkTotal': 'مجموع ارسال + دریافت', 'users': 'کاربران', 'inbounds': 'اینباندها', 'scanner': 'اسکنر IP', 'settings': 'تنظیمات', 'logout': 'خروج',
     'tab.dash': 'داشبورد', 'tab.users': 'مدیریت کاربران', 'tab.inbounds': 'مدیریت اینباندها', 'tab.scanner': 'اسکنر آی‌پی', 'tab.settings': 'تنظیمات',
     'inboundFixedHint': 'فقط اینباندهای پیش‌فرض پنل استفاده می‌شوند. WS/TLS به‌صورت خودکار با دامنه اصلی پنل آماده است؛ Reality را با دامنه و پورت خودتان تکمیل کنید (کلید pbk به‌صورت خودکار ساخته می‌شود).', 'inboundFixed': 'افزودن اینباند غیرفعال است — فقط اینباندهای پیش‌فرض.', 'inboundAuto': 'این اینباند خودکار است و نیازی به تنظیم ندارد.',
     'newUser': 'کاربر جدید', 'newInbound': 'اینباند جدید', 'domain': 'دامنه',
@@ -1695,7 +1619,6 @@ var I18N = {
     'appearance': 'تنظیمات ظاهری', 'themeMode': 'حالت نمایش', 'fixedTheme': 'فونت و رنگ هماهنگ با صفحه ساب + iOS است.', 'theme': 'تم', 'dark': 'تاریک', 'light': 'روشن', 'color': 'رنگ', 'lightMode': 'حالت روشن فعال شد', 'darkMode': 'حالت تاریک فعال شد',
     'red': 'قرمز', 'green': 'سبز', 'blue': 'آبی',
     'panelMusic': 'Panel Music', 'bgMusic': 'Background Music', 'toggleMusic': 'روشن/خاموش', 'changePassword': 'Change Password', 'curPass': 'رمز فعلی', 'newPass': 'رمز جدید', 'changePassBtn': 'تغییر رمز',
-    'contactSub': 'برای پشتیبانی و همکاری با من در ارتباط باشید',
     'createUser': 'ایجاد کاربر جدید', 'editUser': 'ویرایش کاربر', 'username': 'نام کاربری', 'conn': 'اتصال همزمان', 'volume': 'حجم', 'unit': 'واحد', 'expire': 'اعتبار', 'day': 'روز', 'month': 'ماه',
     'inboundsMulti': 'اینباندها (چندتایی)', 'noInboundOpt': 'اینباندی وجود ندارد',
     'inboundPickHint': 'برای هر اینباند، گزینه‌های مخصوصش نمایش داده می‌شود: VLESS غیرپیش‌فرض → Cloudflare و Railway؛ Reality → بدون گزینه.',
@@ -1724,9 +1647,14 @@ var I18N = {
     'toast.userCreated': 'کاربر ایجاد شد', 'toast.userUpdated': 'کاربر بروزرسانی شد', 'toast.userDeleted': 'کاربر حذف شد', 'toast.userToggled': 'وضعیت کاربر تغییر کرد', 'toast.inboundSaved': 'اینباند ذخیره شد', 'toast.domainSaved': 'دامنه ذخیره شد', 'toast.passChanged': 'رمز تغییر کرد', 'toast.err': 'خطا',
     'backupDownloaded': 'بکاپ دانلود شد', 'restoreDone': 'بازیابی انجام شد', 'restoreFailed': 'بازیابی ناموفق', 'restoreUploading': 'در حال آپلود و بازیابی...', 'restoreUploadFailed': 'آپلود ناموفق',
     'panelUpdate': 'بروزرسانی پنل', 'updatePanel': 'بروزرسانی', 'confirmUpdate': 'پنل از GitHub بروزرسانی شود؟', 'updateStarted': 'بروزرسانی شروع شد...', 'updateDone': 'بروزرسانی کامل شد — پنل را ری‌استارت کنید', 'updateFailed': 'بروزرسانی ناموفق بود', 'updateRunning': 'در حال بروزرسانی...',
-    'panelUpdateHint': 'با زدن این دکمه، آخرین نسخه ریپو از GitHub دریافت و روی سرور نصب می‌شود (amirh00sain/SpiderPanel). بعد از اتمام، پنل را در Railway ری‌استارت/ری‌دپلوی کنید تا نسخه جدید اعمال شود.',
+    'panelUpdateHint': 'با زدن این دکمه، آخرین نسخه پنل از منبع رسمی دریافت و روی سرور نصب می‌شود. بعد از اتمام، پنل را ری‌استارت/ری‌دپلوی کنید تا نسخه جدید اعمال شود.',
     'backupRestore': 'بکاپ و بازیابی', 'backup': 'بکاپ (دانلود)', 'restore': 'بازیابی (آپلود)', 'backupRestoreHint': 'بکاپ کامل شامل: کاربران، لینک‌ها، اینباندها، اسکن‌ها، تنظیمات، رمز، گروه‌ها. فایل JSON دانلود/آپلود می‌شود.',
-    'autoconfig': 'Auto Config', 'qrCode': 'QR Code',
+    'qrCode': 'QR Code',
+    'adminPath': 'مسیر ورود مدیریت',
+    'adminPathHint': 'ورود به پنل را پشت یک مسیر مخفی پنهان کنید؛ مثلا: /admin/login/sec/login — بعد از ذخیره، مسیر قدیمی فوراً از کار می‌افتد و هیچ جایی لینک ورود فشناری نمی‌شود.',
+    'adminPathBtn': 'ذخیره مسیر',
+    'adminPathReset': 'بازگشت به پیش‌فرض',
+    'subLinkCopied': 'لینک ساب کپی شد',
     'acAutoBtn': 'Auto', 'acHint': 'اسکن کامل خودکار: پینگ دامنه‌ها → انتخاب Railway/Cloudflare → اسکن IP → تست دامنه‌های TCP → اسکن SNI → پینگ نهایی پنل. همه مراحل با اینترنت خود شما انجام می‌شود.',
     'acEnterDomain': 'لطفاً دامنه پنل را وارد کنید', 'acPingingDomains': 'در حال گرفتن پینگ از دامنه‌ها...', 'acYourDomain': 'دامنه شما', 'acPickDomain': 'دامنه را انتخاب کنید (دامنه Railway → اسکن IP های Railway، غیر از آن → اسکن IP های Cloudflare):',
     'acScanningRailway': 'اسکن IP های Railway و ذخیره ۱۰ تای برتر...', 'acScanningCf': 'اسکن IP های Cloudflare و ذخیره ۱۰ تای برتر...',
@@ -1736,7 +1664,7 @@ var I18N = {
     'login': { 'signIn': 'Sign In' }
   },
   en: {
-    'dash': 'Dashboard', 'navGroup': 'Management', 'advanced': 'Advanced', 'networkTotal': 'Total sent + received', 'users': 'Users', 'inbounds': 'Inbounds', 'scanner': 'IP Scanner', 'settings': 'Settings', 'contact': 'Contact Me', 'logout': 'Logout',
+    'dash': 'Dashboard', 'navGroup': 'Management', 'advanced': 'Advanced', 'networkTotal': 'Total sent + received', 'users': 'Users', 'inbounds': 'Inbounds', 'scanner': 'IP Scanner', 'settings': 'Settings', 'logout': 'Logout',
     'tab.dash': 'Dashboard', 'tab.users': 'Manage Users', 'tab.inbounds': 'Manage Inbounds', 'tab.scanner': 'IP Scanner', 'tab.settings': 'Settings',
     'inboundFixedHint': 'Only the panel’s default inbounds are used. WS/TLS is ready automatically with the panel’s main domain; fill Reality’s domain & ports yourself (pbk is auto-generated).', 'inboundFixed': 'Adding inbounds is disabled — only the default inbounds.', 'inboundAuto': 'This inbound is automatic — nothing to configure.',
     'newUser': 'New User', 'newInbound': 'New Inbound', 'domain': 'Domain',
@@ -1751,7 +1679,6 @@ var I18N = {
     'appearance': 'Appearance', 'themeMode': 'Display Mode', 'fixedTheme': 'Font & colors matched to the sub page + iOS.', 'theme': 'Theme', 'dark': 'Dark', 'light': 'Light', 'color': 'Color', 'lightMode': 'Light mode enabled', 'darkMode': 'Dark mode enabled',
     'red': 'Red', 'green': 'Green', 'blue': 'Blue',
     'panelMusic': 'Panel Music', 'bgMusic': 'Background Music', 'toggleMusic': 'On/Off', 'changePassword': 'Change Password', 'curPass': 'Current Password', 'newPass': 'New Password', 'changePassBtn': 'Change Password',
-    'contactSub': 'Get in touch with me for support and collaboration',
     'createUser': 'Create New User', 'editUser': 'Edit User', 'username': 'Username', 'conn': 'Concurrent Connections', 'volume': 'Traffic', 'unit': 'Unit', 'expire': 'Expiry', 'day': 'Day', 'month': 'Month',
     'inboundsMulti': 'Inbounds (multi-select)', 'noInboundOpt': 'No inbounds available',
     'inboundPickHint': 'Each inbound shows its own options: TLS → scanned-IP switch, Reality → no extra options.',
@@ -1780,9 +1707,14 @@ var I18N = {
     'toast.userCreated': 'User created', 'toast.userUpdated': 'User updated', 'toast.userDeleted': 'User deleted', 'toast.userToggled': 'User status changed', 'toast.inboundSaved': 'Inbound saved', 'toast.domainSaved': 'Domain saved', 'toast.passChanged': 'Password changed', 'toast.err': 'Error',
     'backupDownloaded': 'Backup downloaded', 'restoreDone': 'Restore completed', 'restoreFailed': 'Restore failed', 'restoreUploading': 'Uploading and restoring...', 'restoreUploadFailed': 'Upload failed',
     'panelUpdate': 'Panel Update', 'updatePanel': 'Update', 'confirmUpdate': 'Update the panel from GitHub?', 'updateStarted': 'Update started...', 'updateDone': 'Update finished — restart the panel to apply', 'updateFailed': 'Update failed', 'updateRunning': 'Updating...',
-    'panelUpdateHint': 'Clicking this pulls the latest repo from GitHub and installs it on the server (amirh00sain/SpiderPanel). When finished, restart/redeploy the panel on Railway to apply the new version.',
+    'panelUpdateHint': 'Clicking this pulls the latest panel version and installs it on the server. When finished, restart/redeploy to apply the new version.',
     'backupRestore': 'Backup & Restore', 'backup': 'Backup (Download)', 'restore': 'Restore (Upload)', 'backupRestoreHint': 'Full backup includes: users, links, inbounds, scans, settings, password, and groups. JSON file is downloaded/uploaded.',
-    'autoconfig': 'Auto Config', 'qrCode': 'QR Code',
+    'qrCode': 'QR Code',
+    'adminPath': 'Admin Login Path',
+    'adminPathHint': 'Hide the panel behind a custom secret path, e.g. /admin/login/sec/login. After saving, the old path stops working immediately and no page links to the login URL.',
+    'adminPathBtn': 'Save Path',
+    'adminPathReset': 'Reset to Default',
+    'subLinkCopied': 'Subscription link copied',
     'acAutoBtn': 'Auto', 'acHint': 'Full automatic scan: ping domains → pick Railway/Cloudflare → IP scan → TCP domain test → SNI scan → final panel ping. All steps run from your own internet.',
     'acEnterDomain': 'Please enter the panel domain', 'acPingingDomains': 'Pinging domains...', 'acYourDomain': 'Your domain', 'acPickDomain': 'Pick a domain (Railway → scan Railway IPs, otherwise → scan Cloudflare IPs):',
     'acScanningRailway': 'Scanning Railway IPs, saving top 10...', 'acScanningCf': 'Scanning Cloudflare IPs, saving top 10...',
@@ -1963,8 +1895,8 @@ async function checkAuth() {
     var r = await api('/api/me');
     if (r.authenticated) { showApp(); return; }
   } catch(e) {}
-  // Not authenticated — send to the real panel login page.
-  window.location.href = '/login';
+  // Not authenticated — send to the (customizable) panel login page.
+  window.location.href = window.ADMIN_LOGIN || '/spider/login';
 }
 
 function showLogin() { $id('login-wrap').style.display = 'flex'; $id('app-wrap').classList.remove('active'); }
@@ -2030,8 +1962,8 @@ function initLoginShader() {
 async function doLogout() {
   try { await api('/api/logout', {method: 'POST'}); } catch(e) {}
   localStorage.removeItem('spider_session');
-  // Go to the real panel login page (login.html) instead of the inline form.
-  window.location.href = '/login';
+  // Go to the (customizable) panel login page.
+  window.location.href = window.ADMIN_LOGIN || '/spider/login';
 }
 
 function updateGreeting() {
@@ -2094,7 +2026,8 @@ function switchTab(tab, el) {
   target.style.setProperty('margin-top', '0px', 'important');
   target.style.setProperty('top', '0px', 'important');
   target.style.setProperty('transform', 'none', 'important');
-  if (tab === 'contact' || tab === 'settings' || tab === 'nodes') {
+  if (tab === 'settings') loadAdminPath();
+  if (tab === 'settings' || tab === 'nodes') {
     target.style.setProperty('position', 'static', 'important');
     target.style.setProperty('flex', 'none', 'important');
   }
@@ -2438,17 +2371,17 @@ function copyCfg() {
 
 async function viewSub(configUuid) {
   try {
-    var d = await api('/api/sub/' + encodeURIComponent(configUuid));
-    var uuid = d.config_uuid || configUuid;
-    var subUrl = window.location.origin + '/link/' + uuid;
+    var d = await api('/api/sub-link/' + encodeURIComponent(configUuid));
+    var subUrl = (d && d.url) || '';
+    if (!subUrl) throw new Error('no sub link');
     if (navigator.clipboard) {
       await navigator.clipboard.writeText(subUrl);
-      toast('لینک ساب کپی شد', 'ok');
+      toast(t('subLinkCopied'), 'ok');
     } else {
       window.open(subUrl, '_blank');
     }
   } catch (e) {
-    console.error(e);
+    toast(e.message, 'err');
   }
 }
 function viewQR(userId) { $id('qr-img').src = '/api/users/' + userId + '/qr?t=' + Date.now(); openModal('mod-qr'); }
@@ -2904,6 +2837,34 @@ async function deleteInbound(iid) {
 // ─── Settings ───
 function loadSettings() {
   // Already handled by theme pickers in HTML
+}
+
+// ─── Admin login path ───
+async function loadAdminPath() {
+  try {
+    var d = await api('/api/settings');
+    var el = $id('set-admin-path');
+    if (el && d) el.value = d.admin_path || '';
+  } catch (e) {}
+}
+async function saveAdminPath() {
+  var el = $id('set-admin-path');
+  if (!el) return;
+  try {
+    var d = await api('/api/settings/admin-path', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: el.value.trim() })
+    });
+    toast(t('saved'), 'ok');
+    var nb = (d && d.base) || '/spider';
+    setTimeout(function() { window.location.href = nb + '/login'; }, 900);
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function resetAdminPath() {
+  var el = $id('set-admin-path');
+  if (el) el.value = '';
+  await saveAdminPath();
 }
 
 async function changePassword(e) {

@@ -359,7 +359,7 @@ document.getElementById('login-form').addEventListener('submit', async function(
             var d = await r.json().catch(function() { return {}; });
             throw new Error(d.detail || 'Login failed');
         }
-        location.href = '/spider';
+        location.href = window.ADMIN_BASE || '/spider';
     } catch(ex) {
         errText.textContent = ex.message;
         errDiv.classList.add('show');
