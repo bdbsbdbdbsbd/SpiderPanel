@@ -5,6 +5,50 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Spider Panel Login</title>
 <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<style>
+/* ── CDN-independent fallback: page stays pixel-perfect even if Tailwind/fonts CDN are blocked (Iran filtering) ── */
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#050505;color:#fff;min-height:100vh}
+.h-screen{height:100vh}.w-screen{width:100vw}.relative{position:relative}.absolute{position:absolute}
+.flex{display:flex}.flex-col{flex-direction:column}.items-center{align-items:center}.justify-center{justify-content:center}
+.overflow-hidden{overflow:hidden}.text-center{text-align:center}.mx-4{margin-left:1rem;margin-right:1rem}
+.gap-2{gap:.5rem}.gap-4{gap:1rem}.gap-6{gap:1.5rem}
+.p-8{padding:2rem}.py-3{padding-top:.75rem;padding-bottom:.75rem}.py-3\.5{padding-top:.875rem;padding-bottom:.875rem}
+.pr-4{padding-right:1rem}.pl-12{padding-left:3rem}.mt-2{margin-top:.5rem}
+.text-xs{font-size:.75rem;line-height:1rem}.text-sm{font-size:.875rem;line-height:1.25rem}.text-2xl{font-size:1.5rem;line-height:2rem}
+.font-medium{font-weight:500}.font-bold{font-weight:700}.tracking-wider{letter-spacing:.08em}
+.text-white{color:#fff}.text-on-surface-variant{color:#9aa0a6}
+.rounded-2xl{border-radius:1rem}.rounded-3xl{border-radius:1.5rem}
+.shadow-2xl{box-shadow:0 25px 50px -12px rgba(0,0,0,.7)}
+.max-w-md{max-width:28rem}.w-full{width:100%}
+.top-1-2{top:50%;transform:translateY(-50%)}
+.left-4{left:1rem}.z-10{z-index:10}
+.hidden{display:none!important}
+input.input-glass{width:100%;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);border-radius:.9rem;color:#fff;font-size:.95rem;outline:none;transition:border .2s, box-shadow .2s}
+input.input-glass::placeholder{color:#6b7280}
+input.input-glass:focus{border-color:rgba(255,255,255,.4);box-shadow:0 0 0 4px rgba(255,255,255,.06)}
+.glass-card{background:rgba(16,16,20,.86);border:1px solid rgba(255,255,255,.09);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+button.btn-submit{width:100%;background:#fff;color:#000;border:0;border-radius:.9rem;font-weight:700;font-size:.95rem;cursor:pointer;transition:opacity .2s}
+button.btn-submit:hover{opacity:.88}
+button.btn-submit:disabled{opacity:.55;cursor:wait}
+@keyframes fallback-spin{to{transform:rotate(360deg)}}
+.animate-spin{animation:fallback-spin 1s linear infinite}
+@keyframes fallback-pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.error-msg{color:#ff6b6b}
+.hero-container{position:relative;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.hero-vertical-text{position:absolute;left:22%;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:1.1rem;font-weight:900;font-size:1.15rem;letter-spacing:.1em;color:#e5e5e5;user-select:none}
+.hero-halo{position:absolute;left:12%;top:50%;transform:translate(-50%,-50%);width:500px;height:500px;border:1px solid rgba(255,255,255,.09);border-radius:50%;pointer-events:none}
+.hero-statue{position:absolute;left:-2%;top:50%;transform:translateY(-42%);height:96vh;max-width:44vw;object-fit:contain;opacity:.9;filter:grayscale(1) contrast(1.05);pointer-events:none}
+.badge-item{padding:.35rem .8rem;font-size:.72rem;letter-spacing:.12em;border:1px solid rgba(255,255,255,.25);border-radius:.45rem;color:#d4d4d8;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+@media(max-width:900px){.hero-vertical-text,.hero-halo,.hero-statue{display:none}}
+/* Material Symbols fallback: hide ligature text if font not loaded */
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:normal;font-style:normal;display:inline-block;line-height:1;letter-spacing:normal;text-transform:none;white-space:nowrap;word-wrap:normal;direction:ltr;-webkit-font-feature-settings:'liga';-webkit-font-smoothing:antialiased;font-size:18px;overflow:hidden;max-width:1.2em;max-height:1.2em;vertical-align:middle}
+html:not(.ms-ok) .material-symbols-outlined{font-size:0!important;max-width:none}
+.badge-item{white-space:nowrap}
+img.hero-statue[alt]:not([data-ok]){color:transparent;font-size:0}
+</style>
+
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@500;700;900&display=swap" rel="stylesheet"/>
 
@@ -255,7 +299,7 @@ body {
 <div class="hero-container">
     <div class="hero-halo"></div>
     <span class="hero-vertical-text">SPIDER</span>
-    <img class="hero-statue" src="https://ryoku.dev/art/bone/hero.png" alt="Spider Statue Background">
+    <img class="hero-statue" src="https://ryoku.dev/art/bone/hero.png" alt="" onerror="this.style.display='none'" onload="this.setAttribute('data-ok','1')">
 </div>
 
 <!-- باکس ورود (روی مجسمه و لایه z-10) -->
@@ -349,6 +393,25 @@ document.addEventListener('keydown', function(e) {
 document.addEventListener('gesturestart', function(e) { e.preventDefault(); });
 document.addEventListener('gesturechange', function(e) { e.preventDefault(); });
 document.addEventListener('gestureend', function(e) { e.preventDefault(); });
+</script>
+<script>
+(function(){
+  function ok(){ document.documentElement.classList.add('ms-ok'); }
+  try {
+    if (document.fonts && document.fonts.load) {
+      document.fonts.load('18px "Material Symbols Outlined"', 'lock').then(function(faces){
+        if (faces && faces.length) ok();
+      }).catch(function(){});
+      // retry once in case the stylesheet arrived late
+      setTimeout(function(){
+        if (!document.documentElement.classList.contains('ms-ok'))
+          document.fonts.load('18px "Material Symbols Outlined"', 'lock').then(function(faces){
+            if (faces && faces.length) ok();
+          }).catch(function(){});
+      }, 1500);
+    }
+  } catch(e) {}
+})();
 </script>
 </body>
 </html>

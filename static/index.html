@@ -6,10 +6,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Spider Panel v8</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson-client.min.js"></script>
 <style>
 
 /* Prevent zoom on all devices */
@@ -663,7 +660,7 @@ tr{animation:fadeIn .3s ease}
 
 .srv-bar{margin-bottom:6px}.srv-bar-h{display:flex;justify-content:space-between;font-size:10px;margin-bottom:4px}
 .srv-bar-h strong{font-size:11px}.srv-bar-bg{height:7px;background:var(--bg3);border-radius:4px;overflow:hidden}
-.srv-bar-f{height:100%;border-radius:4px;transition:width .5s ease}
+.srv-bar-f{height:100%;border-radius:4px;transition:width .5s ease;background:var(--gradient)}
 
 /* Modal - Glass */
 .modal{
@@ -1687,7 +1684,7 @@ var I18N = {
     'tab.dash': 'داشبورد', 'tab.users': 'مدیریت کاربران', 'tab.inbounds': 'مدیریت اینباندها', 'tab.scanner': 'اسکنر آی‌پی', 'tab.settings': 'تنظیمات',
     'inboundFixedHint': 'فقط اینباندهای پیش‌فرض پنل استفاده می‌شوند. WS/TLS به‌صورت خودکار با دامنه اصلی پنل آماده است؛ Reality را با دامنه و پورت خودتان تکمیل کنید (کلید pbk به‌صورت خودکار ساخته می‌شود).', 'inboundFixed': 'افزودن اینباند غیرفعال است — فقط اینباندهای پیش‌فرض.', 'inboundAuto': 'این اینباند خودکار است و نیازی به تنظیم ندارد.',
     'newUser': 'کاربر جدید', 'newInbound': 'اینباند جدید', 'domain': 'دامنه',
-    'loading': 'در حال بارگذاری...', 'noUsers': 'هیچ کاربری وجود ندارد', 'noInbounds': 'هیچ اینباندی وجود ندارد', 'errLoadUsers': 'خطا در بارگذاری کاربران', 'errLoadInbounds': 'خطا در بارگذاری اینباندها', 'errLoadStats': 'خطا در بارگذاری آمار',
+    'loading': 'در حال بارگذاری...', 'langChanged': 'زبان تغییر کرد', 'noUsers': 'هیچ کاربری وجود ندارد', 'noInbounds': 'هیچ اینباندی وجود ندارد', 'errLoadUsers': 'خطا در بارگذاری کاربران', 'errLoadInbounds': 'خطا در بارگذاری اینباندها', 'errLoadStats': 'خطا در بارگذاری آمار',
     'live': '● LIVE', 'liveBadge': 'LIVE', 'cloudflareTitle': 'Cloudflare', 'railwayTitle': 'Railway', 'tcpTitle': 'TCP', 'advancedTitle': 'پیشرفته', 'sniTitle': 'SNI',
     'scnTip': 'اسکن زنده از رنج‌های Cloudflare. IPهای پاسخ‌دهنده مرتب و ۱۰ تای اول به صورت خودکار ذخیره می‌شوند.',
     'ipCount': 'تعداد IP', 'targetPort': 'پورت هدف', 'startScan': 'شروع اسکن', 'stop': 'توقف', 'scanning': 'در حال اسکن...', 'scanStopped': 'اسکن متوقف شد',
@@ -1743,7 +1740,7 @@ var I18N = {
     'tab.dash': 'Dashboard', 'tab.users': 'Manage Users', 'tab.inbounds': 'Manage Inbounds', 'tab.scanner': 'IP Scanner', 'tab.settings': 'Settings',
     'inboundFixedHint': 'Only the panel’s default inbounds are used. WS/TLS is ready automatically with the panel’s main domain; fill Reality’s domain & ports yourself (pbk is auto-generated).', 'inboundFixed': 'Adding inbounds is disabled — only the default inbounds.', 'inboundAuto': 'This inbound is automatic — nothing to configure.',
     'newUser': 'New User', 'newInbound': 'New Inbound', 'domain': 'Domain',
-    'loading': 'Loading...', 'noUsers': 'No users found', 'noInbounds': 'No inbounds found', 'errLoadUsers': 'Error loading users', 'errLoadInbounds': 'Error loading inbounds', 'errLoadStats': 'Error loading stats',
+    'loading': 'Loading...', 'langChanged': 'Language changed', 'noUsers': 'No users found', 'noInbounds': 'No inbounds found', 'errLoadUsers': 'Error loading users', 'errLoadInbounds': 'Error loading inbounds', 'errLoadStats': 'Error loading stats',
     'live': '● LIVE', 'liveBadge': 'LIVE', 'cloudflareTitle': 'Cloudflare', 'railwayTitle': 'Railway', 'tcpTitle': 'TCP', 'advancedTitle': 'Advanced', 'sniTitle': 'SNI',
     'scnTip': 'Live scan of Cloudflare ranges. Working IPs are sorted and the first 10 are auto-saved.',
     'ipCount': 'IP Count', 'targetPort': 'Target Port', 'startScan': 'Start Scan', 'stop': 'Stop', 'scanning': 'Scanning...', 'scanStopped': 'Scan stopped',
@@ -1822,7 +1819,7 @@ function toggleLang() {
   LANG = LANG === 'fa' ? 'en' : 'fa';
   localStorage.setItem('spider-lang', LANG);
   applyLang();
-  toast(t(LANG === 'en' ? 'dash' : 'dash'), 'ok');
+  toast(t('langChanged'), 'ok');
 }
 
 // ─── API ───
@@ -2150,15 +2147,15 @@ async function loadDashboard() {
   try {
     var s = await api('/stats');
     var html = '<div class="stats">';
-    html += statCard(iconUsers, '<span id="dash-users">' + s.active_users + ' / ' + s.total_users + '</span>', t('activeUsers'));
-    html += statCard(iconTraffic, '<span id="dash-traffic">' + fmtBytes((s.total_traffic_used_gb || s.traffic_usage_gb || 0) * 1073741824) + '</span>', t('trafficUsed'));
+    html += statCard(iconUsers, '<span dir="ltr" id="dash-users">' + s.active_users + ' / ' + s.total_users + '</span>', t('activeUsers'));
+    html += statCard(iconTraffic, '<span dir="ltr" id="dash-traffic">' + fmtBytes((s.total_traffic_used_gb || s.traffic_usage_gb || 0) * 1073741824) + '</span>', t('trafficUsed'));
     html += statCard(iconConn, '<span id="dash-conn">' + (s.active_connections || '۰') + '</span>', t('activeConns'));
-    html += statCard(iconUptime, '<span id="dash-uptime">...</span>', t('uptime'));
+    html += statCard(iconUptime, '<span dir="ltr" id="dash-uptime">...</span>', t('uptime'));
     html += '</div>';
     html += '<div class="panel"><div class="panel-h" style="align-items:center"><span class="glow">' + t('srv') + '</span><span id="dash-server-status" class="badge badge-g" style="margin-right:auto;font-size:9px;animation:pulse 1.5s infinite">' + t('liveBadge') + '</span></div>';
-    html += '<div class="srv-bar"><div class="srv-bar-h"><strong>' + t('cpu') + '</strong><span id="live-cpu">--</span>%</div><div class="srv-bar-bg"><div class="srv-bar-f" id="bar-cpu" style="width:0%"></div></div></div>';
-    html += '<div class="srv-bar"><div class="srv-bar-h"><strong>' + t('ram') + '</strong><span id="live-ram">--</span></div><div class="srv-bar-bg"><div class="srv-bar-f" id="bar-ram" style="width:0%"></div></div></div>';
-    html += '<div class="srv-bar"><div class="srv-bar-h"><strong>' + t('disk') + '</strong><span id="live-disk">--</span></div><div class="srv-bar-bg"><div class="srv-bar-f" id="bar-disk" style="width:0%"></div></div></div>';
+    html += '<div class="srv-bar"><div class="srv-bar-h"><strong>' + t('cpu') + '</strong><span dir="ltr"><span id="live-cpu">--</span>%</span></div><div class="srv-bar-bg"><div class="srv-bar-f" id="bar-cpu" style="width:0%"></div></div></div>';
+    html += '<div class="srv-bar"><div class="srv-bar-h"><strong>' + t('ram') + '</strong><span dir="ltr"><span id="live-ram">--</span></span></div><div class="srv-bar-bg"><div class="srv-bar-f" id="bar-ram" style="width:0%"></div></div></div>';
+    html += '<div class="srv-bar"><div class="srv-bar-h"><strong>' + t('disk') + '</strong><span dir="ltr"><span id="live-disk">--</span></span></div><div class="srv-bar-bg"><div class="srv-bar-f" id="bar-disk" style="width:0%"></div></div></div>';
     html += '<div style="font-size:10px;color:var(--txt2);margin-top:12px;padding-top:10px;border-top:1px solid var(--bg3)">';
     html += '<div style="text-align:center;margin-top:6px"><span>Uptime: <strong style="color:var(--txt)" id="live-uptime">...</strong></span></div>';
     html += '</div></div>';
@@ -4070,6 +4067,10 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // Start neon bars when tab opens
+function updateNeonBars() {
+  // Repaint dashboard usage bars (kept for legacy callers); safe no-data no-op.
+  try { if (typeof refreshLiveStats === 'function') refreshLiveStats(); } catch(e) {}
+}
 setTimeout(updateNeonBars, 500);
 
 // Login form submit
