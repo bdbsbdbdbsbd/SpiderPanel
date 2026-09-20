@@ -14,6 +14,16 @@ curl -fsSL https://raw.githubusercontent.com/gAhkejdkdf/SpiderPanel/main/start.s
 
 > 💡 **دستور بالا را کپی کرده و در ترمینال VPS اجرا کنید.**
 
+### 🔒 فعال‌سازی TLS روی VPS (برای کار کردن کانفیگ‌ها)
+
+کانفیگ‌های TLS به HTTPS روی پورت 443 نیاز دارند. یک دامنه را به IP سرور وصل کنید، بعد:
+
+```bash
+spiderpanel tls vpn.example.com
+```
+
+این دستور Caddy را نصب می‌کند و خودش سرتیفیکیت می‌گیرد و تمدید می‌کند. بدون دامنه، TLS کار نمی‌کند.
+
 ────────
 
 ### 🚄 دیپلوی روی Railway

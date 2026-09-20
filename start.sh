@@ -1476,6 +1476,19 @@ status_panel() {
     fi
 
 
+    if command -v caddy >/dev/null 2>&1; then
+        if systemd_ok && systemctl is-active caddy >/dev/null 2>&1; then
+            echo "TLS: on"
+        elif command -v pgrep >/dev/null 2>&1 && pgrep -f "caddy run" >/dev/null 2>&1; then
+            echo "TLS: on"
+        else
+            echo "TLS: installed (stopped)"
+        fi
+    else
+        echo "TLS: off"
+    fi
+
+
     echo
 }
 
@@ -1569,6 +1582,13 @@ info_panel() {
 
     echo
 
+    _tls_d="$(_tls_domain)"
+    if [[ -n "$_tls_d" ]]; then
+        echo "TLS: https://${_tls_d}/spider"
+    else
+        echo "TLS: off (enable: spiderpanel tls <domain>)"
+    fi
+    echo
     echo "Admin Password: ${password:-NOT FOUND}"
 
     echo "Application: $APP_DIR"
@@ -1774,6 +1794,14 @@ case "${1:-menu}" in
         bash "$APP/start.sh" uninstall
         ;;
 
+    tls)
+        bash "$APP/start.sh" tls "$2"
+        ;;
+
+    untls)
+        bash "$APP/start.sh" untls
+        ;;
+
     *)
         echo
         echo "SpiderPanel"
@@ -1786,6 +1814,8 @@ case "${1:-menu}" in
         echo "6) Update"
         echo "7) Logs"
         echo "8) Uninstall"
+        echo "9) Enable TLS (https)"
+        echo "10) Disable TLS"
         echo "0) Exit"
         echo
 
@@ -1823,6 +1853,15 @@ case "${1:-menu}" in
 
             8)
                 bash "$APP/start.sh" uninstall
+                ;;
+
+            9)
+                read -r -p "Domain: " d
+                bash "$APP/start.sh" tls "$d"
+                ;;
+
+            10)
+                bash "$APP/start.sh" untls
                 ;;
 
             0)
@@ -1917,6 +1956,154 @@ install_panel() {
 
 
     ok "Installation completed."
+}
+
+
+# ============================================================
+# TLS (Caddy automatic HTTPS -> 127.0.0.1:8080)
+# ============================================================
+# TLS configs (VLESS+WS on 443) need something terminating TLS in front
+# of the panel. Railway does this automatically; on a bare VPS nothing
+# listens on 443, so TLS configs can never connect. `tls <domain>`
+# installs Caddy as a reverse proxy with fully automatic certificates.
+
+_tls_domain() {
+    sed -n 's/^# BEGIN SpiderPanel //p' /etc/caddy/Caddyfile 2>/dev/null | head -1
+}
+
+install_caddy() {
+    if command -v caddy >/dev/null 2>&1; then
+        return 0
+    fi
+    log "Installing Caddy (automatic HTTPS)..."
+    case "$OS_ID" in
+        ubuntu|debian|raspbian|linuxmint|pop|kali)
+            apt-get update -y
+            apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+            apt-get update -y
+            apt-get install -y caddy
+            ;;
+        fedora|rhel|centos|rocky|almalinux|ol|oracle)
+            (dnf install -y 'dnf-command(copr)' || yum install -y yum-plugin-copr) >/dev/null 2>&1 || true
+            (dnf copr enable -y @caddy/caddy || yum copr enable -y @caddy/caddy)
+            (dnf install -y caddy || yum install -y caddy)
+            ;;
+        arch|manjaro)
+            pacman -Sy --noconfirm caddy
+            ;;
+        alpine)
+            apk add caddy
+            ;;
+        *)
+            fail "Unsupported OS for automatic Caddy install ($OS_ID). Install Caddy manually, then re-run: start.sh tls <domain>"
+            ;;
+    esac
+    command -v caddy >/dev/null 2>&1 || fail "Caddy installation failed."
+}
+
+tls_panel() {
+    local domain="${1:-}"
+    [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] \
+        || fail "Usage: start.sh tls <domain>   (example: start.sh tls vpn.example.com)"
+    [[ "$domain" == *.* ]] || fail "TLS needs a real domain pointing to this server (not an IP)."
+    [[ "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && fail "TLS needs a domain name, not an IP. Point a domain to this server first."
+    domain="$(echo "$domain" | tr '[:upper:]' '[:lower:]')"
+
+    # Warn (don't fail) when DNS doesn't resolve here yet - issuance needs it.
+    if getent hosts "$domain" >/dev/null 2>&1; then
+        log "DNS OK: $domain resolves."
+    else
+        warn "DNS for $domain does not resolve yet - point it to this server or certificate issuance will fail."
+    fi
+
+    install_caddy
+
+    local caddyfile="/etc/caddy/Caddyfile"
+    mkdir -p /etc/caddy
+    [[ -f "$caddyfile" ]] || : > "$caddyfile"
+    if grep -q "# BEGIN SpiderPanel $domain" "$caddyfile" 2>/dev/null; then
+        log "Caddy already configured for $domain."
+    else
+        cp -f "$caddyfile" "$caddyfile.bak" 2>/dev/null || true
+        # Drop any older SpiderPanel block, then append the new one.
+        sed -i '/# BEGIN SpiderPanel/,/# END SpiderPanel/d' "$caddyfile"
+        {
+            echo "# BEGIN SpiderPanel $domain"
+            echo "$domain {"
+            echo "	reverse_proxy 127.0.0.1:8080"
+            echo "}"
+            echo "# END SpiderPanel"
+        } >> "$caddyfile"
+        log "Caddy site added for $domain (backup: $caddyfile.bak)."
+    fi
+
+    caddy fmt --overwrite "$caddyfile" >/dev/null 2>&1 || true
+    caddy validate --config "$caddyfile" --adapter caddyfile >/dev/null 2>&1 \
+        || fail "Caddy config invalid - see $caddyfile (backup at $caddyfile.bak)."
+
+    # Firewall: ACME + HTTPS need 80/443.
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow 80,443/tcp >/dev/null 2>&1 || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-service=http --add-service=https >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+
+    if systemd_ok; then
+        systemctl enable caddy >/dev/null 2>&1 || true
+        if systemctl is-active caddy >/dev/null 2>&1; then
+            systemctl reload caddy
+        else
+            systemctl start caddy
+        fi
+    else
+        warn "No systemd - starting Caddy in background."
+        pkill -f "caddy run" >/dev/null 2>&1 || true
+        nohup caddy run --config "$caddyfile" --adapter caddyfile >/var/log/caddy-spiderpanel.log 2>&1 &
+    fi
+
+    # Wait for HTTPS (first issuance can take a bit).
+    log "Waiting for https://$domain (issuing certificate if needed)..."
+    local i code="000"
+    for i in $(seq 1 18); do
+        code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 "https://$domain/spider/login" 2>/dev/null || echo 000)"
+        [[ "$code" =~ ^[234][0-9][0-9]$ ]] && break
+        sleep 5
+    done
+    echo
+    if [[ "$code" =~ ^[234][0-9][0-9]$ ]]; then
+        ok "TLS is live: https://$domain/spider"
+        echo "Panel:  https://$domain/spider"
+        echo "Subs and TLS configs now connect through port 443."
+    else
+        warn "HTTPS not reachable yet (last HTTP code: $code)."
+        echo "Check DNS points to this server, then: systemctl status caddy"
+    fi
+}
+
+untls_panel() {
+    local caddyfile="/etc/caddy/Caddyfile"
+    if [[ -f "$caddyfile" ]] && grep -q "# BEGIN SpiderPanel" "$caddyfile"; then
+        cp -f "$caddyfile" "$caddyfile.bak" 2>/dev/null || true
+        sed -i '/# BEGIN SpiderPanel/,/# END SpiderPanel/d' "$caddyfile"
+        ok "SpiderPanel site removed from Caddy."
+        if systemd_ok; then
+            if grep -q '[^[:space:]]' "$caddyfile"; then
+                systemctl reload caddy >/dev/null 2>&1 || true
+            else
+                systemctl stop caddy >/dev/null 2>&1 || true
+                systemctl disable caddy >/dev/null 2>&1 || true
+                log "Caddyfile empty - Caddy stopped."
+            fi
+        else
+            pkill -f "caddy run" >/dev/null 2>&1 || true
+        fi
+    else
+        log "No SpiderPanel TLS block found."
+    fi
 }
 
 
@@ -2016,6 +2203,26 @@ main() {
 
             ;;
 
+        tls)
+
+            root "$@"
+
+            detect
+
+            tls_panel "${2:-}"
+
+            ;;
+
+        untls)
+
+            root "$@"
+
+            detect
+
+            untls_panel
+
+            ;;
+
         *)
 
             echo
@@ -2032,6 +2239,8 @@ main() {
             echo "  start.sh update"
             echo "  start.sh logs"
             echo "  start.sh uninstall"
+            echo "  start.sh tls <domain>"
+            echo "  start.sh untls"
             echo
 
             exit 1

@@ -8033,7 +8033,34 @@ async def websocket_tunnel(ws: WebSocket, uuid: str, proxy_override: str = None)
             proxy_override = unquote(proxy_override)
         except Exception:
             pass
-    await ws.accept()
+    # ── WS early data (v2rayNG / Clash / Xray clients) ──────────────────
+    # Real clients send the first VLESS bytes base64url-encoded in the
+    # Sec-WebSocket-Protocol handshake header (our own Clash/SingBox
+    # profiles advertise max-early-data). Without consuming it here the
+    # handshake stalls and TLS configs fail in real clients.
+    early = b""
+    early_token = ""
+    try:
+        _proto_hdr = ws.headers.get("sec-websocket-protocol") or ""
+        if _proto_hdr:
+            early_token = _proto_hdr.split(",")[0].strip()
+            if early_token:
+                _padded = early_token + "=" * (-len(early_token) % 4)
+                _decoded = base64.urlsafe_b64decode(_padded.encode("ascii"))
+                if 0 < len(_decoded) <= 65536:
+                    early = _decoded
+                else:
+                    early_token = ""
+    except Exception:
+        early, early_token = b"", ""
+    try:
+        if early_token:
+            await ws.accept(subprotocol=early_token)
+        else:
+            await ws.accept()
+    except Exception:
+        # Client went away during the handshake.
+        return
     m = _get_main()
 
     async with m.LINKS_LOCK:
@@ -8078,10 +8105,14 @@ async def websocket_tunnel(ws: WebSocket, uuid: str, proxy_override: str = None)
     writer = None
 
     try:
-        first_msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
-        if first_msg["type"] == "websocket.disconnect":
-            return
-        first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
+        # When the client used handshake early-data it will NOT resend those
+        # bytes as a message — start from them and only top up if short.
+        first_chunk = bytes(early)
+        if len(first_chunk) < 24:
+            first_msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
+            if first_msg["type"] == "websocket.disconnect":
+                return
+            first_chunk += first_msg.get("bytes") or (first_msg.get("text") or "").encode()
         if not first_chunk:
             return
 
