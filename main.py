@@ -226,7 +226,7 @@ def _validate_listener_port(port: int, exclude_id: str | None = None) -> None:
 
 
 async def load_state():
-    global LINKS, AUTH, SUBS, USERS, SETTINGS, GROUPS, IP_POOL, IP_BLACKLIST, INBOUNDS, NODES, PENDING_NODE_DELETIONS, SUB_HASH_INDEX, SUB_HASH_RECORDS, SUB_HASH_REVOKED, CURRENT_SUB_HASH
+    global LINKS, AUTH, SUBS, USERS, SETTINGS, GROUPS, IP_POOL, IP_BLACKLIST, INBOUNDS, NODES, PENDING_NODE_DELETIONS, SUB_HASH_INDEX, SUB_HASH_RECORDS, SUB_HASH_REVOKED, CURRENT_SUB_HASH, SHARED_CONFIGS
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if DATA_FILE.exists():
@@ -234,6 +234,7 @@ async def load_state():
                 raw = await f.read()
             data = json.loads(raw)
             LINKS.update(data.get("links", {}))
+            SHARED_CONFIGS.update(data.get("shared_configs", {}))
             SUBS.update(data.get("subs", {}))
             USERS.update(data.get("users", {}))
             # Always load saved password hash (no secret-key guard — causes password reset bugs)
@@ -444,6 +445,7 @@ async def _save_state_now():
                 "server_info": _server_info,
                 "groups": dict(GROUPS),
                 "inbounds": dict(INBOUNDS),
+                "shared_configs": dict(SHARED_CONFIGS),
                 "ip_pool": list(IP_POOL),
                 "ip_blacklist": list(IP_BLACKLIST),
                 "nodes": dict(NODES),
@@ -589,6 +591,10 @@ BOT_TASK: asyncio.Task | None = None
 # ── Inbounds (for user config generation) ────────────────────────────────
 INBOUNDS: dict = {}  # inbound_id → {name, protocol, port, network, security, domain, sni, external_port, fingerprint, reality_settings, xhttp_settings, created_at}
 INBOUNDS_LOCK = asyncio.Lock()
+
+# ── Shared configs (admin-pasted third-party links, sent to every user) ──
+SHARED_CONFIGS: dict = {}  # shared_id → {raw, name, created_at}
+SHARED_CONFIGS_LOCK = asyncio.Lock()
 
 # ── Groups ─────────────────────────────────────────────────────────────────
 GROUPS: dict = {}  # group_id → {name, description, user_ids, ip_pool, rules, created_at}
@@ -3388,6 +3394,16 @@ async def _build_subscription_data_by_uuid(config_uuid: str, request_host: str =
     if all_custom:
         configs.extend(all_custom)
 
+    # Shared (admin-pasted, third-party) links go to every active user.
+    # vless:// ones flow through every format; other schemes ride along in
+    # the raw sub + portal page (tracked separately, never parsed).
+    try:
+        _shared_all = await shared_links_for_user(str(user.get("username") or "user"))
+    except Exception:
+        _shared_all = []
+    shared_extra = [s for s in _shared_all if "vless://" not in s]
+    configs.extend(_shared_all)
+
     if not configs:
         raise HTTPException(status_code=404, detail="no configs found")
 
@@ -3428,6 +3444,8 @@ async def _build_subscription_data_by_uuid(config_uuid: str, request_host: str =
         "vless_link": config,
         "config": config,
         "configs": all_configs,
+        "shared_extra": shared_extra,
+        "shared_count": len(_shared_all),
         "inbound_ids": inbound_ids,
         "sni": user.get("sni", ""),
         "path": user.get("path", ""),
@@ -4390,7 +4408,7 @@ async def hashed_sub_route(sub_hash: str, request: Request):
             body = _build_vjson_body(sub_data, allow_insecure)
             ctype = "application/json; charset=utf-8"
         else:
-            raw_text = _build_sub_uri_text(_sub_configs_from_data(sub_data))
+            raw_text = _build_sub_uri_text(_sub_configs_from_data(sub_data) + list(sub_data.get("shared_extra") or []))
             body = base64.b64encode(raw_text.encode("utf-8")).decode("ascii")
             ctype = "text/plain; charset=utf-8"
         _config_cache_put(cache_key, (body, ctype))
@@ -6297,6 +6315,10 @@ async def get_user_subscription(user_id: str, request: Request, _=Depends(requir
         if cfg:
             configs.append(cfg)
     configs.extend(node_subscription_configs(u))
+    try:
+        configs.extend(await shared_links_for_user(str(u.get("username") or "user")))
+    except Exception:
+        pass
     if not configs:
         fallback_iid = find_default_tls_ws_inbound_id() if find_default_tls_ws_inbound_id() in selected_ids else (u.get("inbound_id") if u.get("inbound_id") and not is_node_control_inbound(u.get("inbound_id")) else None)
         cfg = generate_user_config(user_id, u, fallback_iid, request_host=request_host) if fallback_iid else ""
@@ -6391,6 +6413,142 @@ app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# SHARED CONFIGS — admin-pasted third-party links distributed to every user
+# ══════════════════════════════════════════════════════════════════════════════
+# The panel never parses these links (any scheme works: vless/vmess/trojan/
+# hysteria2/ss/...). Only the #remark fragment is read/replaced; the rest of
+# the link passes through byte-identical.
+
+
+def _split_shared_remark(link):
+    """Split an opaque config link into (head, remark)."""
+    link = str(link or "").strip()
+    head, sep, frag = link.partition("#")
+    try:
+        remark = unquote(frag).strip() if sep else ""
+    except Exception:
+        remark = ""
+    return head, remark
+
+
+def _set_shared_remark(link, name):
+    """Return the link with its #remark replaced (rest byte-identical)."""
+    head, _ = _split_shared_remark(link)
+    return head + "#" + quote(str(name or ""), safe="")
+
+
+def _valid_shared_link(link):
+    s = str(link or "").strip()
+    if not s or len(s) > 8192:
+        return False
+    head = s.partition("#")[0]
+    if any(ch.isspace() for ch in head):
+        return False
+    if "://" not in head:
+        return False
+    scheme = head.split("://", 1)[0]
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", scheme or ""))
+
+
+async def shared_links_for_user(username):
+    """Personalized shared links for one user (remark = name • username)."""
+    async with SHARED_CONFIGS_LOCK:
+        items = sorted(SHARED_CONFIGS.values(), key=lambda r: r.get("created_at") or "")
+    out = []
+    for rec in items:
+        raw = str(rec.get("raw") or "").strip()
+        name = str(rec.get("name") or "").strip() or "Shared"
+        if not _valid_shared_link(raw):
+            continue
+        out.append(_set_shared_remark(raw, f"{name} • {username}"))
+    return out
+
+
+@app.get("/api/shared-configs")
+async def list_shared_configs(auth=Depends(require_auth)):
+    """Admin-only: list all shared configs."""
+    async with SHARED_CONFIGS_LOCK:
+        items = [
+            {"id": sid, "name": rec.get("name", ""), "raw": rec.get("raw", ""),
+             "scheme": str(rec.get("raw", "")).split("://", 1)[0].lower()[:16],
+             "created_at": rec.get("created_at", "")}
+            for sid, rec in SHARED_CONFIGS.items()
+        ]
+    items.sort(key=lambda r: r["created_at"] or "")
+    return {"shared": items, "count": len(items)}
+
+
+@app.post("/api/shared-configs")
+async def import_shared_configs(request: Request, auth=Depends(require_auth)):
+    """Admin-only: import shared links (one per line). Duplicates/invalid skipped."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad request")
+    if isinstance(body, dict) and isinstance(body.get("links"), str):
+        lines = body["links"].splitlines()
+    elif isinstance(body, dict) and body.get("link"):
+        lines = [str(body.get("link"))]
+    elif isinstance(body, list):
+        lines = [str(x) for x in body]
+    else:
+        raise HTTPException(status_code=400, detail="links required")
+    added, skipped = [], 0
+    async with SHARED_CONFIGS_LOCK:
+        have = {str(r.get("raw") or "").strip() for r in SHARED_CONFIGS.values()}
+        for line in lines:
+            s = str(line or "").strip().strip("\"'\u201c\u201d\u2018\u2019")
+            if not s or not _valid_shared_link(s) or s in have:
+                skipped += 1
+                continue
+            _head, remark = _split_shared_remark(s)
+            sid = generate_short_id()
+            while sid in SHARED_CONFIGS:
+                sid = generate_short_id()
+            rec = {"raw": s, "name": remark or f"Shared-{len(SHARED_CONFIGS) + 1}",
+                   "created_at": datetime.now().isoformat()}
+            SHARED_CONFIGS[sid] = rec
+            have.add(s)
+            added.append({"id": sid, **rec})
+    if added:
+        asyncio.create_task(save_state())
+        log_activity("system", f"{len(added)} \u06a9\u0627\u0646\u0641\u06cc\u06af \u0627\u0634\u062a\u0631\u0627\u06a9\u06cc \u0627\u0636\u0627\u0641\u0647 \u0634\u062f", "ok")
+    return {"ok": True, "added": added, "added_count": len(added), "skipped": skipped}
+
+
+@app.patch("/api/shared-configs/{shared_id}")
+async def rename_shared_config(shared_id: str, request: Request, auth=Depends(require_auth)):
+    """Admin-only: rename a shared config (only the #remark changes)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad request")
+    name = str((body or {}).get("name") or "").strip()[:80]
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    async with SHARED_CONFIGS_LOCK:
+        rec = SHARED_CONFIGS.get(shared_id)
+        if not rec:
+            raise HTTPException(status_code=404, detail="not found")
+        rec["name"] = name
+        rec["raw"] = _set_shared_remark(rec["raw"], name)
+    asyncio.create_task(save_state())
+    return {"ok": True, "id": shared_id, "name": name}
+
+
+@app.delete("/api/shared-configs/{shared_id}")
+async def delete_shared_config(shared_id: str, auth=Depends(require_auth)):
+    """Admin-only: delete a shared config."""
+    async with SHARED_CONFIGS_LOCK:
+        if shared_id not in SHARED_CONFIGS:
+            raise HTTPException(status_code=404, detail="not found")
+        SHARED_CONFIGS.pop(shared_id, None)
+    asyncio.create_task(save_state())
+    log_activity("system", "\u06cc\u06a9 \u06a9\u0627\u0646\u0641\u06cc\u06af \u0627\u0634\u062a\u0631\u0627\u06a9\u06cc \u062d\u0630\u0641 \u0634\u062f", "warn")
+    return {"ok": True, "deleted": shared_id}
+
+
 # USER SUBSCRIPTION DATA API (Public, UUID only)
 # ══════════════════════════════════════════════════════════════════════════════
 

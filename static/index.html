@@ -1140,6 +1140,10 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
             <span class="nav-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><line x1="12" y1="8" x2="5" y2="16"/><line x1="12" y1="8" x2="19" y2="16"/></svg></span>
             <span data-i18n="nodes">نودها</span>
           </div>
+          <div class="nav-item" onclick="switchTab('shared',this)">
+            <span class="nav-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg></span>
+            <span data-i18n="shared">کانفیگ اشتراکی</span>
+          </div>
           <div class="nav-item" onclick="switchTab('settings',this)">
             <span class="nav-ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg></span>
             <span data-i18n="settings">تنظیمات</span>
@@ -1420,6 +1424,24 @@ input,textarea,select{user-select:text!important;-webkit-user-select:text!import
         </div>
       </div>
 
+      <div class="tab-content hidden" id="tab-shared">
+        <div class="spd-acc" style="margin-bottom:10px">
+          <button type="button" class="spd-acc-head" onclick="spdToggleAcc('shared-main',this)" aria-expanded="false">
+            <span class="spd-acc-title"><strong data-i18n="shared">کانفیگ اشتراکی</strong></span>
+            <span class="material-symbols-outlined spd-acc-arrow">expand_more</span>
+          </button>
+          <div class="spd-acc-body" id="acc-shared-main">
+            <div class="px-hint" style="margin-bottom:12px"><span data-i18n="sharedDesc">لینک‌های آماده را اینجا بگذارید تا برای همه کاربران ارسال شوند. اسم هر کدام خودکار شخصی‌سازی می‌شود.</span></div>
+            <textarea id="shared-input" rows="5" dir="ltr" data-i18n="sharedPlaceholder" style="width:100%;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:12px;color:var(--txt);padding:12px;font-size:12px;font-family:monospace;outline:none;resize:vertical" placeholder="vless://... / trojan://... / hysteria2://... (one per line)"></textarea>
+            <div style="display:flex;gap:10px;margin:12px 0 16px;flex-wrap:wrap">
+              <button class="btn btn-p" onclick="importShared()"><span data-i18n="sharedImport">افزودن</span></button>
+              <button class="btn btn-g" onclick="loadShared()"><span data-i18n="sharedReload">به‌روزرسانی</span></button>
+            </div>
+            <div id="shared-list"></div>
+          </div>
+        </div>
+      </div>
+
     </div><!-- /content -->
   </div><!-- /main-area -->
 </div><!-- /app-wrap -->
@@ -1609,7 +1631,7 @@ var selectedTheme = localStorage.getItem('spider-theme') || 'dark';
 var LANG = localStorage.getItem('spider-lang') || 'fa';
 var I18N = {
   fa: {
-    'dash': 'داشبورد', 'navGroup': 'مدیریت', 'advanced': 'پیشرفته', 'networkTotal': 'مجموع ارسال + دریافت', 'users': 'کاربران', 'inbounds': 'اینباندها', 'scanner': 'اسکنر IP', 'settings': 'تنظیمات', 'logout': 'خروج',
+    'dash': 'داشبورد', 'navGroup': 'مدیریت', 'advanced': 'پیشرفته', 'networkTotal': 'مجموع ارسال + دریافت', 'users': 'کاربران', 'inbounds': 'اینباندها', 'scanner': 'اسکنر IP', 'settings': 'تنظیمات', 'logout': 'خروج', 'shared': 'کانفیگ اشتراکی', 'sharedDesc': 'لینک‌های آماده را اینجا بگذارید تا برای همه کاربران ارسال شوند. اسم هر کدام خودکار شخصی‌سازی می‌شود.', 'sharedPlaceholder': 'vless://... / trojan://... / hysteria2://... (هر خط یک لینک)', 'sharedImport': 'افزودن', 'sharedReload': 'به‌روزرسانی', 'sharedEmpty': 'هنوز کانفیگ اشتراکی ثبت نشده است.', 'sharedCount': '{n} کانفیگ برای همه کاربران ارسال می‌شود.', 'sharedRename': 'تغییر نام', 'sharedRenamePrompt': 'اسم جدید:', 'sharedRenamed': 'اسم تغییر کرد.', 'sharedDelete': 'حذف', 'sharedDeleteConfirm': 'این کانفیگ اشتراکی حذف شود؟', 'sharedDeleted': 'حذف شد.', 'sharedAdded': '{n} کانفیگ اضافه شد.', 'sharedSkipped': '{n} خط رد شد (تکراری/نامعتبر)',
     'tab.dash': 'داشبورد', 'tab.users': 'مدیریت کاربران', 'tab.inbounds': 'مدیریت اینباندها', 'tab.scanner': 'اسکنر آی‌پی', 'tab.settings': 'تنظیمات',
     'inboundFixedHint': 'فقط اینباندهای پیش‌فرض پنل استفاده می‌شوند. WS/TLS به‌صورت خودکار با دامنه اصلی پنل آماده است؛ Reality را با دامنه و پورت خودتان تکمیل کنید (کلید pbk به‌صورت خودکار ساخته می‌شود).', 'inboundFixed': 'افزودن اینباند غیرفعال است — فقط اینباندهای پیش‌فرض.', 'inboundAuto': 'این اینباند خودکار است و نیازی به تنظیم ندارد.',
     'newUser': 'کاربر جدید', 'newInbound': 'اینباند جدید', 'domain': 'دامنه',
@@ -1675,7 +1697,7 @@ var I18N = {
     'login': { 'signIn': 'Sign In' }
   },
   en: {
-    'dash': 'Dashboard', 'navGroup': 'Management', 'advanced': 'Advanced', 'networkTotal': 'Total sent + received', 'users': 'Users', 'inbounds': 'Inbounds', 'scanner': 'IP Scanner', 'settings': 'Settings', 'logout': 'Logout',
+    'dash': 'Dashboard', 'navGroup': 'Management', 'advanced': 'Advanced', 'networkTotal': 'Total sent + received', 'users': 'Users', 'inbounds': 'Inbounds', 'scanner': 'IP Scanner', 'settings': 'Settings', 'logout': 'Logout', 'shared': 'Shared Configs', 'sharedDesc': 'Paste ready-made links here — they are sent to every user with an auto-personalized name.', 'sharedPlaceholder': 'vless://... / trojan://... / hysteria2://... (one per line)', 'sharedImport': 'Add', 'sharedReload': 'Reload', 'sharedEmpty': 'No shared configs yet.', 'sharedCount': '{n} configs sent to all users.', 'sharedRename': 'Rename', 'sharedRenamePrompt': 'New name:', 'sharedRenamed': 'Renamed.', 'sharedDelete': 'Delete', 'sharedDeleteConfirm': 'Delete this shared config?', 'sharedDeleted': 'Deleted.', 'sharedAdded': '{n} configs added.', 'sharedSkipped': '{n} lines skipped (duplicate/invalid)',
     'tab.dash': 'Dashboard', 'tab.users': 'Manage Users', 'tab.inbounds': 'Manage Inbounds', 'tab.scanner': 'IP Scanner', 'tab.settings': 'Settings',
     'inboundFixedHint': 'Only the panel’s default inbounds are used. WS/TLS is ready automatically with the panel’s main domain; fill Reality’s domain & ports yourself (pbk is auto-generated).', 'inboundFixed': 'Adding inbounds is disabled — only the default inbounds.', 'inboundAuto': 'This inbound is automatic — nothing to configure.',
     'newUser': 'New User', 'newInbound': 'New Inbound', 'domain': 'Domain',
@@ -2034,7 +2056,7 @@ function toggleNodeAccordion(btn) {
 }
 
 function switchTab(tab, el) {
-  if (['users','inbounds','scanner','settings'].indexOf(tab) >= 0) toggleNavAccordion(true);
+  if (['users','inbounds','scanner','settings','shared'].indexOf(tab) >= 0) toggleNavAccordion(true);
   document.querySelectorAll('.nav-item').forEach(function(n) { n.classList.remove('active'); });
   if (el) el.classList.add('active');
   var content = document.querySelector('.content');
@@ -2054,6 +2076,7 @@ function switchTab(tab, el) {
   target.style.setProperty('top', '0px', 'important');
   target.style.setProperty('transform', 'none', 'important');
   if (tab === 'settings') { loadAdminPath(); loadDbInfo(); }
+  if (tab === 'shared') { loadShared(); }
   if (tab === 'settings' || tab === 'nodes') {
     target.style.setProperty('position', 'static', 'important');
     target.style.setProperty('flex', 'none', 'important');
@@ -3880,6 +3903,66 @@ function _nodeStatusClass(node) {
 
 function _nodeFlag(node) { return node.country_flag || node.remote_flag || '🌐'; }
 function _nodeIp(node) { return node.public_ip || node.remote_ip || '--'; }
+
+var ALL_SHARED = [];
+async function loadShared() {
+  try {
+    var d = await api('/api/shared-configs');
+    ALL_SHARED = (d && d.shared) || [];
+    renderShared();
+  } catch(e) {
+    var el = $id('shared-list');
+    if (el) el.innerHTML = '<div style="color:var(--red);padding:20px">' + esc(e.message || 'ERR') + '</div>';
+  }
+}
+function renderShared() {
+  var wrap = $id('shared-list');
+  if (!wrap) return;
+  if (!ALL_SHARED.length) {
+    wrap.innerHTML = '<div style="color:var(--txt2);text-align:center;padding:30px 0;font-size:14px">' + esc(t('sharedEmpty')) + '</div>';
+    return;
+  }
+  var html = '<div style="color:var(--txt2);font-size:12px;margin-bottom:10px">' + esc(t('sharedCount').replace('{n}', ALL_SHARED.length)) + '</div>';
+  ALL_SHARED.forEach(function(s) {
+    html += '<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid rgba(255,255,255,.1);border-radius:12px;margin-bottom:8px;background:rgba(255,255,255,.03)">' +
+      '<span style="font-size:11px;font-weight:700;color:var(--teal);border:1px solid rgba(255,255,255,.15);border-radius:6px;padding:2px 8px;white-space:nowrap">' + esc(s.scheme || '?') + '</span>' +
+      '<span style="flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" dir="auto">' + esc(s.name) + '</span>' +
+      '<button class="btn btn-g" style="padding:6px 12px;font-size:12px" onclick="renameShared(\'' + s.id + '\')">' + esc(t('sharedRename')) + '</button>' +
+      '<button class="btn btn-r" style="padding:6px 12px;font-size:12px" onclick="deleteShared(\'' + s.id + '\')">' + esc(t('sharedDelete')) + '</button>' +
+      '</div>';
+  });
+  wrap.innerHTML = html;
+}
+async function importShared() {
+  var ta = $id('shared-input');
+  var links = ta ? ta.value : '';
+  if (!links.trim()) return;
+  try {
+    var d = await api('/api/shared-configs', {method:'POST', body:{links: links}});
+    toast(t('sharedAdded').replace('{n}', d.added_count) + (d.skipped ? ' (' + t('sharedSkipped').replace('{n}', d.skipped) + ')' : ''), 'ok');
+    if (ta) ta.value = '';
+    loadShared();
+  } catch(e) { toast(e.message, 'err'); }
+}
+async function renameShared(id) {
+  var cur = null;
+  ALL_SHARED.forEach(function(s){ if (s.id === id) cur = s; });
+  var name = prompt(t('sharedRenamePrompt'), cur ? cur.name : '');
+  if (!name || !name.trim()) return;
+  try {
+    await api('/api/shared-configs/' + encodeURIComponent(id), {method:'PATCH', body:{name: name.trim()}});
+    toast(t('sharedRenamed'), 'ok');
+    loadShared();
+  } catch(e) { toast(e.message, 'err'); }
+}
+async function deleteShared(id) {
+  if (!confirm(t('sharedDeleteConfirm'))) return;
+  try {
+    await api('/api/shared-configs/' + encodeURIComponent(id), {method:'DELETE'});
+    toast(t('sharedDeleted'), 'ok');
+    loadShared();
+  } catch(e) { toast(e.message, 'err'); }
+}
 
 async function loadNodes() {
   try {
