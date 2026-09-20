@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>Spider Panel Login</title>
+<title>Login</title>
 <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
 <style>
 /* ── CDN-independent fallback: page stays pixel-perfect even if Tailwind/fonts CDN are blocked (Iran filtering) ── */
@@ -161,22 +161,7 @@ body {
     50% { opacity: 0.85; transform: scale(1.02); }
 }
 
-/* کلمه عمودی SPIDER روی مجسمه */
-.hero-vertical-text {
-    position: absolute;
-    top: 50%;
-    left: 38%;
-    transform: translateY(-50%);
-    writing-mode: vertical-rl;
-    text-orientation: upright;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: clamp(1.4rem, 2.2vw, 2.4rem);
-    font-weight: 900;
-    letter-spacing: 0.45em;
-    color: rgba(255, 255, 255, 0.7);
-    text-shadow: 0 2px 12px rgba(0, 0, 0, 0.9);
-    z-index: 2;
-}
+
 
 /* کادر مینیمال گوشه بالا راست */
 .badge-bar {
@@ -292,22 +277,19 @@ body {
 <!-- نوار شناور بالا (بدون کلید release) -->
 <div class="badge-bar">
     <span class="badge-item">★ 2026</span>
-    <span class="badge-item">SPIDER</span>
-</div>
+    </div>
 
 <!-- بک‌گراند: مجسمه دایترد و هاله (در سمت چپ) -->
 <div class="hero-container">
     <div class="hero-halo"></div>
-    <span class="hero-vertical-text">SPIDER</span>
-    <img class="hero-statue" src="https://ryoku.dev/art/bone/hero.png" alt="" onerror="this.style.display='none'" onload="this.setAttribute('data-ok','1')">
-</div>
+        </div>
 
 <!-- باکس ورود (روی مجسمه و لایه z-10) -->
 <div class="glass-card rounded-3xl w-full max-w-md p-8 mx-4 flex flex-col gap-6 shadow-2xl z-10 relative">
     <!-- Header -->
     <div class="flex flex-col items-center gap-2 text-center">
-        <img src="/static/spider-logo.svg" alt="Spider" onerror="this.style.display='none'" style="width:96px;height:96px;margin-bottom:2px">
-        <h1 class="text-2xl font-bold tracking-wider text-white">SPIDER PANEL</h1>
+        <img src="/static/spider-logo.svg" alt="Panel" onerror="this.style.display='none'" style="width:96px;height:96px;margin-bottom:2px">
+        <h1 class="text-2xl font-bold tracking-wider text-white">PANEL</h1>
         <p class="text-xs text-on-surface-variant font-medium">High Performance Panel</p>
     </div>
 

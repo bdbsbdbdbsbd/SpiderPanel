@@ -25,7 +25,7 @@ import io
 import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("Spider-Gateway")
+logger = logging.getLogger("Panel-Gateway")
 
 try:
     import qrcode
@@ -53,7 +53,7 @@ _sys.modules.setdefault("main", _sys.modules[__name__])
 
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
-app = FastAPI(title="Spider Gateway", docs_url=None, redoc_url=None)
+app = FastAPI(title="Panel", docs_url=None, redoc_url=None)
 
 # Import and include xhttp_siz10 router - deferred until globals are defined
 xhttp_router = None
@@ -220,7 +220,7 @@ def _validate_listener_port(port: int, exclude_id: str | None = None) -> None:
         raise HTTPException(status_code=400, detail="Internal Port must be between 1 and 65535")
     owner = _listener_port_in_use(port, exclude_id=exclude_id)
     if owner == "panel":
-        raise HTTPException(status_code=409, detail=f"Internal Port {port} is already used by the SpiderPanel HTTP server")
+        raise HTTPException(status_code=409, detail=f"Internal Port {port} is already used by the panel HTTP server")
     if owner and owner != "invalid":
         raise HTTPException(status_code=409, detail=f"Internal Port {port} is already used by inbound {owner}")
 
@@ -552,7 +552,7 @@ SETTINGS = {
         "admin_ids": [],
         "channel": "",
         "welcome_msg": (
-            "🕷️ <b>SpiderPanel</b>\n\n"
+            "🤖 <b>ربات مدیریت اشتراک</b>\n\n"
             "به ربات اختصاصی پنل خوش آمدید ✨\n"
             "از دکمه‌های زیر اشتراک خود را مدیریت کنید."
         ),
@@ -1353,7 +1353,7 @@ _DB_SETUP_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>اتصال به دیتابیس — Spider Panel</title>
+<title>اتصال به دیتابیس</title>
 <style>
 :root{color-scheme:dark}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1390,7 +1390,7 @@ button.go:disabled{filter:grayscale(.4);cursor:wait}
 </head>
 <body>
 <div class="card">
-  <div class="logo">SPIDER<small>PANEL</small></div>
+  <div class="logo">VPN</div>
   <h1>اتصال به دیتابیس</h1>
   <p class="sub">این پنل بدون دیتابیس خارجی کار نمی‌کند.<br>همه اطلاعات (کاربران، تنظیمات، لینک‌ها) در MySQL ذخیره می‌شود.</p>
   <div class="tabs">
@@ -2029,7 +2029,7 @@ async def startup():
             except Exception as e:
                 logger.warning(f"Xray apply on boot failed: {e}")
         log_activity("system", "سرور راه‌اندازی شد", "ok")
-    logger.info(f"Spider Panel v8 (commit 24d7594) started on port {CONFIG['port']}")
+    logger.info(f"Panel v8 (commit 24d7594) started on port {CONFIG['port']}")
     # Include XHTTP router for xhttp-siz10 endpoints (already merged into main.py)
     global xhttp_router
     # router is already defined in this module
@@ -2340,7 +2340,7 @@ def remote_node_config(node: dict, user: dict, remark_tag: str | None = None) ->
     node_country = str(node.get("country") or "").strip()
     node_ip = str(node.get("public_ip") or node.get("remote_ip") or "").strip()
     node_identity = " ".join(x for x in (node_flag, node_country, node_ip) if x).strip()
-    remark = f"Spider-{user.get('username', 'user')} {node_identity}".strip()
+    remark = f"{user.get('username', 'user')} {node_identity}".strip()
     if node_label and node_label not in remark:
         remark += f" · {node_label}"
     if remark_tag and remark_tag not in remark:
@@ -2414,7 +2414,7 @@ def generate_random_path(prefix: str = "", length: int = 6) -> str:
 def now_ir() -> datetime:
     return datetime.now(IRAN_TZ)
 
-def generate_vless_link(uuid: str, host: str, remark: str = "Spider", protocol: str = DEFAULT_PROTOCOL) -> str:
+def generate_vless_link(uuid: str, host: str, remark: str = "VPN", protocol: str = DEFAULT_PROTOCOL) -> str:
     """می‌سازد VLESS share-link متناسب با پروتکل انتخاب‌شده (WS کلاسیک یا یکی از مدهای XHTTP)."""
     if protocol == "vless-ws":
         path = f"/ws/{uuid}"
@@ -2564,7 +2564,7 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
         logger.warning("Skipping config for user %s: invalid config UUID %r", user_id, config_uuid)
         return ""
     username = user.get("username", user_id)
-    rem = f"Spider-{username}"
+    rem = f"{username}"
     if remark_tag:
         rem = f"{rem} {remark_tag}"
     remark = quote(rem)
@@ -3226,7 +3226,7 @@ async def _build_subscription_data_by_uuid(config_uuid: str):
             vless = generate_vless_link(
                 config_uuid,
                 host,
-                remark=f"Spider-{link['label']}",
+                remark=f"{link['label']}",
                 protocol=proto,
             )
             return {
@@ -3386,7 +3386,7 @@ async def subscription_all(_=Depends(require_auth)):
     host = SETTINGS.get("domain") or get_host()
     async with LINKS_LOCK:
         lines = [
-            generate_vless_link(uid, host, remark=f"Spider-{d['label']}", protocol=d.get("protocol", DEFAULT_PROTOCOL))
+            generate_vless_link(uid, host, remark=f"{d['label']}", protocol=d.get("protocol", DEFAULT_PROTOCOL))
             for uid, d in LINKS.items()
             if is_link_allowed(d)
         ]
@@ -3528,7 +3528,7 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         for lid in link_ids:
             link = LINKS.get(lid)
             if link and is_link_allowed(link):
-                lines.append(generate_vless_link(lid, host, remark=f"Spider-{link['label']}", protocol=link.get("protocol", DEFAULT_PROTOCOL)))
+                lines.append(generate_vless_link(lid, host, remark=f"{link['label']}", protocol=link.get("protocol", DEFAULT_PROTOCOL)))
 
     content = base64.b64encode("\n".join(lines).encode()).decode()
     return Response(
@@ -3563,7 +3563,7 @@ CURRENT_SUB_HASH: dict = {}    # config_uuid -> active hash (persisted; mirrors 
 
 _SUB_HASH_RE = re.compile(r"^[A-Za-z0-9_-]{44}$")
 _SUB_VERSION = "9.5.50"
-_SUB_BRAND = "Spider"
+_SUB_BRAND = "VPN"
 _SUB_B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
 # Mirrors the worker's per-isolate config-output cache (TTL 15s, 512 entries,
@@ -4233,7 +4233,7 @@ def _build_vjson_body(data: dict, allow_insecure: bool = False) -> str:
                 "alpn": ["http/1.1"],
             }
         outbounds.append(ob)
-    return json.dumps({"remarks": "SpiderPanel", "outbounds": outbounds}, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps({"remarks": str(data.get("username") or ""), "outbounds": outbounds}, ensure_ascii=False, separators=(",", ":"))
 
 
 # ── Error & portal pages (worker serveErrorPage / serveProSubscriptionPage) ──
@@ -4247,7 +4247,7 @@ def _sub_error_page(code: int) -> str:
     return (
         "<!doctype html><html lang=\"en\" dir=\"ltr\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        f"<title>{code} — {_SUB_BRAND}Panel</title><style>"
+        f"<title>{code}</title><style>"
         "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
         "background:radial-gradient(1200px 600px at 80% -10%,#062823,transparent),#101013;"
         "color:#f4f4f5;font-family:-apple-system,Segoe UI,Tahoma,sans-serif}"
@@ -4353,7 +4353,7 @@ async def hashed_sub_route(sub_hash: str, request: Request):
     out.headers["subscription-userinfo"] = userinfo
     out.headers["x-subscription-userinfo"] = userinfo
     out.headers["profile-title"] = title_b64
-    out.headers["content-disposition"] = f"inline; filename=spider-{sub_hash[:8]}.txt"
+    out.headers["content-disposition"] = f"inline; filename=sub-{sub_hash[:8]}.txt"
     return out
 
 
@@ -4622,7 +4622,7 @@ async def regenerate_panel_api_key(_=Depends(require_auth)):
         SETTINGS["security_token"] = new_key
         SETTINGS["panel_api_key_rotated_at"] = datetime.now().isoformat()
     await save_state()
-    log_activity("auth", "SpiderPanel API Key regenerated", "warn")
+    log_activity("auth", "API Key regenerated", "warn")
     return {"ok": True, "api_key": new_key, "prefix": "spdr_", "rotated_at": SETTINGS.get("panel_api_key_rotated_at")}
 
 
@@ -4860,7 +4860,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "uuid": uid,
         **LINKS[uid],
         "expired": False,
-        "vless_link": generate_vless_link(uid, host, remark=f"Spider-{label}", protocol=protocol),
+        "vless_link": generate_vless_link(uid, host, remark=f"{label}", protocol=protocol),
         "sub_url": sub_hash_url(uid),
     }
 
@@ -4877,7 +4877,7 @@ async def list_links(_=Depends(require_auth)):
             **d,
             "protocol": proto,
             "expired": is_link_expired(d),
-            "vless_link": generate_vless_link(uid, host, remark=f"Spider-{d['label']}", protocol=proto),
+            "vless_link": generate_vless_link(uid, host, remark=f"{d['label']}", protocol=proto),
             "sub_url": sub_hash_url(uid),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
@@ -6301,7 +6301,7 @@ async def public_sub_data(uuid_key: str, request: Request):
             "limit_bytes": link.get("limit_bytes", 0),
             "limit_fmt": "∞" if link.get("limit_bytes", 0) == 0 else fmt_bytes(link["limit_bytes"]),
             "expires_at": link.get("expires_at"),
-            "vless_link": generate_vless_link(lid, host, remark=f"Spider-{link['label']}", protocol=proto),
+            "vless_link": generate_vless_link(lid, host, remark=f"{link['label']}", protocol=proto),
             "sub_url": sub_hash_url(lid),
             "connections": conn_count,
         })

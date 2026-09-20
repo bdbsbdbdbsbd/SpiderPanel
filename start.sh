@@ -6,10 +6,10 @@ set -Eeuo pipefail
 # ============================================================
 
 APP_DIR="${SPIDER_APP_DIR:-/opt/SpiderPanel}"
-REPO="${SPIDER_REPO:-https://github.com/amirh00sain/SpiderPanel.git}"
+REPO="${SPIDER_REPO:-https://github.com/gAhkejdkdf/SpiderPanel.git}"
 BRANCH="${SPIDER_BRANCH:-main}"
 
-INSTALLER_URL="${SPIDER_INSTALLER_URL:-https://raw.githubusercontent.com/amirh00sain/SpiderPanel/main/start.sh}"
+INSTALLER_URL="${SPIDER_INSTALLER_URL:-https://raw.githubusercontent.com/gAhkejdkdf/SpiderPanel/main/start.sh}"
 
 ENV_FILE="/etc/spider-panel.env"
 SERVICE="spider-panel"

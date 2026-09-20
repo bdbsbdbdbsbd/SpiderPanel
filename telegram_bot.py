@@ -38,7 +38,7 @@ import time
 
 import main as P
 
-logger = logging.getLogger("Spider-Bot")
+logger = logging.getLogger("Panel-Bot")
 
 TG_API = "https://api.telegram.org/bot{token}/{method}"
 
@@ -79,7 +79,7 @@ def _cfg() -> dict:
     b["admin_ids"] = admins
     if not b.get("welcome_msg"):
         b["welcome_msg"] = (
-            "🕷️ <b>SpiderPanel</b>\n\n"
+            "🤖 <b>ربات مدیریت اشتراک</b>\n\n"
             "به ربات اختصاصی پنل خوش آمدید ✨\n"
             "از دکمه‌های زیر اشتراک خود را مدیریت کنید."
         )
@@ -492,7 +492,7 @@ async def _create_sub_user(chat_id: int, tg_user: dict, username: str, limit_gb:
             "concurrent_connections": 0,
             "created_at": P.datetime.now().isoformat(),
             "status": "active",
-            "server": "SpiderPanel-Bot",
+            "server": "telegram-bot",
             "config_uuid": config_uuid,
             "subscription_uuid": subscription_uuid,
             "sni": "",
@@ -665,7 +665,7 @@ async def _menu_buy(chat_id, msg_id=None):
         txt = "⛔ فروشگاه در حال حاضر پلنی ندارد."
         btns = [[{"text": "🏠 منوی اصلی", "callback_data": "u:home"}]]
     else:
-        txt = "🛍 <b>فروشگاه SpiderPanel</b>\n\nپلن مورد نظرت را انتخاب کن:\n"
+        txt = "🛍 <b>فروشگاه</b>\n\nپلن مورد نظرت را انتخاب کن:\n"
         for p in plans:
             gb_i = int(p.get("gb") or 0)
             txt += f"\n▫️ <b>{_html(p.get('name'))}</b>\n   {gb_i} GB · {p.get('days')} روز · 💰 {_toman(p.get('price'))} تومان"
@@ -754,7 +754,7 @@ async def _menu_wallet(chat_id, msg_id=None):
     bal = await _wallet_balance(chat_id)
     cfg = _cfg()
     txt = (
-        "💳 <b>کیف پول SpiderPanel</b>\n"
+        "💳 <b>کیف پول</b>\n"
         "صندوق شخصی تو برای خرید و تمدید\n\n"
         f"─ ─ ─ ─ ─ ─ ─ ─\n"
         f"💰 موجودی قابل استفاده: <b>{_toman(bal)} تومان</b>\n"
@@ -1190,7 +1190,7 @@ async def _menu_delete_service(chat_id, msg_id, tg_user):
 # ── Message rendering (legacy quick views) ──────────────────────────────────
 def _fmt_subscription(r: dict) -> str:
     lines = [
-        "🕷️ <b>SpiderPanel — اشتراک شما</b>\n",
+        "📱 <b>اشتراک شما</b>\n",
         f"👤 نام کاربری: <code>{_html(r['username'])}</code>",
         f"📶 وضعیت: {_status_icon(r['status'], r['is_active'], r['used'], r['limit'])}",
         f"⚡ مصرف: <code>{_html(r['used_fmt'])}</code> از <code>{_html(r['limit_fmt'])}</code>"
@@ -1213,7 +1213,7 @@ def _fmt_subscription(r: dict) -> str:
 
 def _fmt_config(r: dict, include_sub=True) -> str:
     lines = [
-        "🕷️ <b>SpiderPanel — کانفیگ</b>\n",
+        "⚙️ <b>کانفیگ شما</b>\n",
         f"👤 کاربر: <code>{_html(r['username'])}</code>",
         "",
         "📄 <b>کانفیگ VLESS:</b>",
@@ -1255,7 +1255,7 @@ async def _cmd_start(chat_id, tg_user, is_admin, text=""):
             if owner and owner != str(chat_id):
                 rec["invited_by"] = owner
     await _save_ref_record(chat_id, rec)
-    welcome = cfg.get("welcome_msg") or "🕷️ SpiderPanel — به ربات خوش آمدید"
+    welcome = cfg.get("welcome_msg") or "به ربات خوش آمدید 👋"
     if _is_admin(chat_id):
         extra = "\n\n(شما ادمین هستید — از منوی ادمین هم می‌توانید استفاده کنید.)"
     elif user:
@@ -1330,7 +1330,7 @@ async def _cmd_qr(chat_id):
 
 async def _cmd_help(chat_id):
     lines = [
-        "🕷️ <b>راهنمای SpiderPanel</b>\n",
+        "📖 <b>راهنما</b>\n",
         "🕹 <b>منو</b> — منوی اصلی ربات",
         "🛒 <b>خرید</b> — خرید پلن از فروشگاه",
         "💳 <b>کیف پول</b> — شارژ کارت‌به‌کارت و خرید",
@@ -1382,7 +1382,7 @@ async def _cmd_stats(chat_id):
     cfg = _cfg()
     pending = sum(1 for c in (cfg.get("charges") or {}).values() if c.get("status") == "pending")
     lines = [
-        "📈 <b>آمار پنل SpiderPanel</b>\n",
+        "📈 <b>آمار پنل</b>\n",
         f"👥 کاربران: <b>{len(users)}</b>",
         f"✅ فعال: <b>{active}</b>   ⏳ منقضی: <b>{expired}</b>   ⛔ غیرفعال: <b>{disabled}</b>",
         f"🔌 اتصالات فعلی: <b>{connected}</b>",
