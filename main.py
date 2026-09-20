@@ -2222,13 +2222,29 @@ async def shutdown():
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_host() -> str:
-    return os.environ.get("RAILWAY_PUBLIC_DOMAIN", CONFIG["host"])
+    """Public host used for generated configs/links.
+
+    Priority: RAILWAY_PUBLIC_DOMAIN env → admin-set domain →
+    last host the panel was actually opened with (auto-captured from
+    incoming requests, persisted) → configured fallback.
+    """
+    for cand in (os.environ.get("RAILWAY_PUBLIC_DOMAIN"),
+                 SETTINGS.get("domain"),
+                 SETTINGS.get("auto_host")):
+        cleaned = _clean_host(cand)
+        if cleaned:
+            return cleaned
+    return CONFIG["host"]
 
 
-def _safe_host(*candidates: str) -> str:
-    """Return a normalized hostname without scheme/path/port placeholders."""
+def _clean_host(*candidates) -> str:
+    """Return a normalized public hostname, or "" when none is usable.
+
+    Same normalization as _safe_host but never falls back to localhost —
+    callers use it to decide whether an explicit/captured host exists.
+    """
     from urllib.parse import urlsplit
-    bad = {"", "0.0.0.0", "127.0.0.1", "localhost", "SERVER_IP"}
+    bad = {"", "0.0.0.0", "127.0.0.1", "::1", "localhost", "SERVER_IP"}
     for c in candidates:
         if c is None:
             continue
@@ -2242,9 +2258,29 @@ def _safe_host(*candidates: str) -> str:
         except Exception:
             host = raw.split("/", 1)[0].strip()
         host = host.strip().rstrip(".")
-        if host and host not in bad:
+        if host and host.lower() not in bad:
             return host
-    return get_host()
+    return ""
+
+
+def _safe_host(*candidates: str) -> str:
+    """Return a normalized hostname without scheme/path/port placeholders."""
+    return _clean_host(*candidates) or get_host()
+
+
+def get_request_host(request) -> str:
+    """Host the current request arrived with (proxy-aware).
+
+    Returns "" when the request came via localhost/unknown, so callers fall
+    back to the configured domain instead of emitting localhost links.
+    """
+    try:
+        fwd = (request.headers.get("x-forwarded-host") or "") if request is not None else ""
+        first = fwd.split(",")[0].strip() if fwd else ""
+        direct = (request.headers.get("host") or "") if request is not None else ""
+        return _clean_host(first, direct)
+    except Exception:
+        return ""
 
 DEFAULT_TLS_WS_INBOUND_NAME = "پیش‌فرض TLS + WS"
 LEGACY_TLS_WS_NAMES = {"VLESS+WS پیش‌فرض", "VLESS + WS پیش‌فرض", "پیش‌فرض VLESS+WS", "پیش‌فرض VLESS + WS"}
@@ -2540,7 +2576,7 @@ def generate_short_id() -> str:
     """Generate a shorter ID for user management."""
     return secrets.token_hex(6)
 
-def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr: str = None, remark_tag: str = None) -> str:
+def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr: str = None, remark_tag: str = None, request_host: str = "") -> str:
     """Build a VLESS config string for one inbound of a user.
 
     Three config families (one per inbound type):
@@ -2552,6 +2588,9 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
 
     addr (scanned custom IP) overrides only the connect address; host/sni stay
     on the real domain so the TLS handshake reaches the service.
+
+    request_host (host the current request arrived with) is used when no
+    explicit domain is configured, so configs never carry localhost.
     """
     inbound = INBOUNDS.get(inbound_id) if inbound_id else None
     proto = (inbound.get("protocol") if inbound else None) or (user.get("protocol") or "vless")
@@ -2653,19 +2692,19 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
 
     # ── TLS (WS default / XHTTP selectable) — served by the FastAPI relay ──
     # address/host/sni always = the panel main domain; port 443 (Railway TLS).
-    panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
+    panel_domain = _safe_host(SETTINGS.get("domain"), request_host, get_host())
 
     # The exact default TLS+WS inbound is the only inbound served by the FastAPI
     # WebSocket relay. Other inbounds must use their own stored transport/domain/port.
     if is_default_tls_ws_inbound(inbound):
-        panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
+        panel_domain = _safe_host(SETTINGS.get("domain"), request_host, get_host())
         host = addr_ip or panel_domain
         port = addr_port or "443"
         transport = "ws"
         security = "tls"
     else:
         inbound_domain = str((inbound or {}).get("external_domain") or (inbound or {}).get("domain") or "").strip()
-        host = addr_ip or _safe_host(inbound_domain, SETTINGS.get("domain"), get_host())
+        host = addr_ip or _safe_host(inbound_domain, SETTINGS.get("domain"), request_host, get_host())
         port = addr_port or str((inbound or {}).get("external_port") or (inbound or {}).get("port") or 443)
         network = str((inbound or {}).get("network") or "").strip().lower()
         # Use the selected inbound's transport first. The user's global transport_type
@@ -2713,7 +2752,7 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
     return f"vless://{config_uuid}@{host}:{port}?{params}#{remark}"
 
 
-def generate_custom_ip_configs(user_id: str, user: dict) -> dict:
+def generate_custom_ip_configs(user_id: str, user: dict, request_host: str = "") -> dict:
     """Build extra configs from scanned IPs — ONLY for VLESS/WS inbounds.
 
     Telegram inbounds are SKIPPED because:
@@ -2742,7 +2781,7 @@ def generate_custom_ip_configs(user_id: str, user: dict) -> dict:
                 continue
             for i, ip in enumerate(cf_ips[:10], 1):
                 try:
-                    cfg = generate_user_config(user_id, user, iid_, addr=ip, remark_tag=f"Cloudflare{i}")
+                    cfg = generate_user_config(user_id, user, iid_, addr=ip, remark_tag=f"Cloudflare{i}", request_host=request_host)
                 except Exception as e:
                     logger.warning(f"cf custom-ip config gen failed for {ip}: {e}")
                     continue
@@ -2762,7 +2801,7 @@ def generate_custom_ip_configs(user_id: str, user: dict) -> dict:
                 continue
             for i, ip in enumerate(rw_ips[:10], 1):
                 try:
-                    cfg = generate_user_config(user_id, user, iid_, addr=ip, remark_tag=f"Railway{i}")
+                    cfg = generate_user_config(user_id, user, iid_, addr=ip, remark_tag=f"Railway{i}", request_host=request_host)
                 except Exception as e:
                     logger.warning(f"railway custom-ip config gen failed for {ip}: {e}")
                     continue
@@ -2771,7 +2810,7 @@ def generate_custom_ip_configs(user_id: str, user: dict) -> dict:
     return out
 
 
-def generate_status_config(user: dict, configs: list) -> str:
+def generate_status_config(user: dict, configs: list, request_host: str = "") -> str:
     """Generate a status config (config-status) with fake random stats.
 
     This config is placed FIRST in the subscription so clients display it as
@@ -2789,7 +2828,7 @@ def generate_status_config(user: dict, configs: list) -> str:
     config_uuid = user.get("config_uuid", "") or user_id
 
     # Use panel domain from SETTINGS (required for TLS WS/XHTTP)
-    panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
+    panel_domain = _safe_host(SETTINGS.get("domain"), request_host, get_host())
 
     # Generate fake stats for the status config
     # Random volume: 100GB - 500GB total, 10GB - 100GB used
@@ -2954,6 +2993,24 @@ async def deployment_ui_fixes(request: Request, call_next):
         if k.lower() not in {"content-length", "content-encoding", "etag", "transfer-encoding"}
     }
     return HTMLResponse(html, status_code=response.status_code, headers=safe_headers, media_type="text/html")
+
+
+@app.middleware("http")
+async def capture_public_host(request: Request, call_next):
+    """Remember the host the panel is actually opened with.
+
+    Runs before every endpoint, so generated configs/sub links use the same
+    domain the admin/user came with — no manual domain setting needed.
+    An explicitly configured domain always wins over this auto value.
+    """
+    try:
+        seen = get_request_host(request)
+        if seen and SETTINGS.get("auto_host") != seen:
+            SETTINGS["auto_host"] = seen
+            _SAVE_DIRTY.set()
+    except Exception:
+        pass
+    return await call_next(request)
 
 
 
@@ -3210,18 +3267,21 @@ async def _find_user_by_config_uuid(config_uuid: str):
     return None, None
 
 
-async def _build_subscription_data_by_uuid(config_uuid: str):
+async def _build_subscription_data_by_uuid(config_uuid: str, request_host: str = ""):
     """Build the public subscription data for a config UUID only.
 
     Username-based public subscription addressing is intentionally not supported.
     The UUID is the only public identifier for an individual subscription.
+
+    request_host (host the current request arrived with) flows into generated
+    configs so they use the reachable domain instead of localhost.
     """
     uid, user = await _find_user_by_config_uuid(config_uuid)
     if not user:
         async with LINKS_LOCK:
             link = LINKS.get(config_uuid)
         if link and is_link_allowed(link):
-            host = SETTINGS.get("domain") or get_host()
+            host = _safe_host(SETTINGS.get("domain"), request_host, get_host())
             proto = link.get("protocol", DEFAULT_PROTOCOL)
             vless = generate_vless_link(
                 config_uuid,
@@ -3300,7 +3360,7 @@ async def _build_subscription_data_by_uuid(config_uuid: str):
             if ib and (p_ == "reality" or sec_ == "reality"):
                 if not str(ib.get("external_domain") or "").strip() or not str(ib.get("external_port") or "").strip():
                     continue
-            cfg = generate_user_config(uid, user, iid_)
+            cfg = generate_user_config(uid, user, iid_, request_host=request_host)
             if cfg:
                 configs.append(cfg)
         except Exception as exc:
@@ -3319,11 +3379,11 @@ async def _build_subscription_data_by_uuid(config_uuid: str):
         if not fallback_iid or fallback_iid not in selected:
             fallback_iid = next((iid for iid in inbound_ids if not is_node_control_inbound(iid)), None)
         if fallback_iid:
-            fallback_config = generate_user_config(uid, user, fallback_iid)
+            fallback_config = generate_user_config(uid, user, fallback_iid, request_host=request_host)
             if fallback_config:
                 configs = [fallback_config]
 
-    custom_cfgs = generate_custom_ip_configs(uid, user)
+    custom_cfgs = generate_custom_ip_configs(uid, user, request_host=request_host)
     all_custom = custom_cfgs.get("railway", []) + custom_cfgs.get("cf", [])
     if all_custom:
         configs.extend(all_custom)
@@ -3331,7 +3391,7 @@ async def _build_subscription_data_by_uuid(config_uuid: str):
     if not configs:
         raise HTTPException(status_code=404, detail="no configs found")
 
-    status_config = generate_status_config(user, configs)
+    status_config = generate_status_config(user, configs, request_host=request_host)
     all_configs = [status_config] + configs if status_config else configs
 
     config = None
@@ -4289,7 +4349,7 @@ async def hashed_sub_route(sub_hash: str, request: Request):
 
     config_uuid = rec["config_uuid"]
     try:
-        sub_data = await _build_subscription_data_by_uuid(config_uuid)
+        sub_data = await _build_subscription_data_by_uuid(config_uuid, request_host=get_request_host(request))
     except HTTPException:
         sub_data = None
     if sub_data is None or not bool(sub_data.get("is_active", True)):
@@ -4380,7 +4440,7 @@ async def _subscription_api_handler(sub_hash: str, request: Request):
         return JSONResponse(content={"ok": False, "error": "revoked_hash"}, status_code=410, headers=cors)
     config_uuid = rec["config_uuid"]
     try:
-        data = await _build_subscription_data_by_uuid(config_uuid)
+        data = await _build_subscription_data_by_uuid(config_uuid, request_host=get_request_host(request))
     except HTTPException:
         return JSONResponse(content={"ok": False, "error": "user_deleted"}, status_code=404, headers=cors)
     if not bool(data.get("is_active", True)):
@@ -5900,7 +5960,7 @@ async def create_user(request: Request, auth=Depends(require_replication_auth)):
         "config_url": f"https://{host}/api/users/{user_id}/config",
         "qr_url": f"https://{host}/api/users/{user_id}/qr",
         "subscription_url": sub_hash_url(USERS[user_id].get('config_uuid')),
-        "config": generate_user_config(user_id, USERS[user_id], inbound_id),
+        "config": generate_user_config(user_id, USERS[user_id], inbound_id, request_host=get_request_host(request)),
     }
 
 @app.patch("/api/users/{user_id}/toggle")
@@ -6160,8 +6220,9 @@ async def delete_user(user_id: str, auth=Depends(require_replication_auth)):
     return {"ok": True, "deleted": target_uid, "config_uuid": config_uuid}
 
 @app.get("/api/users/{user_id}/config")
-async def get_user_config(user_id: str, _=Depends(require_auth)):
+async def get_user_config(user_id: str, request: Request, _=Depends(require_auth)):
     """Return the protocol config string for a user."""
+    request_host = get_request_host(request)
     async with USERS_LOCK:
         u = USERS.get(user_id)
         if not u:
@@ -6169,10 +6230,10 @@ async def get_user_config(user_id: str, _=Depends(require_auth)):
         _selected = list(u.get("inbound_ids") or [])
         _default = find_default_tls_ws_inbound_id()
         _config_iid = _default if _default in _selected else (u.get("inbound_id") if u.get("inbound_id") in _selected else (_selected[0] if _selected else u.get("inbound_id")))
-        config = generate_user_config(user_id, u, _config_iid)
+        config = generate_user_config(user_id, u, _config_iid, request_host=request_host)
         username = u.get("username")
         protocol = u.get("protocol")
-    host = SETTINGS.get("domain") or get_host()
+    host = _safe_host(SETTINGS.get("domain"), request_host, get_host())
     return {
         "user_id": user_id,
         "username": username,
@@ -6213,9 +6274,10 @@ async def get_user_qr(user_id: str, _=Depends(require_auth)):
                     headers={"Content-Disposition": f"inline; filename={username}.png"})
 
 @app.get("/api/users/{user_id}/subscription")
-async def get_user_subscription(user_id: str, _=Depends(require_auth)):
+async def get_user_subscription(user_id: str, request: Request, _=Depends(require_auth)):
     """Return the subscription URL for a user."""
-    host = SETTINGS.get("domain") or get_host()
+    request_host = get_request_host(request)
+    host = _safe_host(SETTINGS.get("domain"), request_host, get_host())
     async with USERS_LOCK:
         u = USERS.get(user_id)
         if not u:
@@ -6231,13 +6293,13 @@ async def get_user_subscription(user_id: str, _=Depends(require_auth)):
     for iid in selected_ids:
         if is_node_control_inbound(iid):
             continue
-        cfg = generate_user_config(user_id, u, iid)
+        cfg = generate_user_config(user_id, u, iid, request_host=request_host)
         if cfg:
             configs.append(cfg)
     configs.extend(node_subscription_configs(u))
     if not configs:
         fallback_iid = find_default_tls_ws_inbound_id() if find_default_tls_ws_inbound_id() in selected_ids else (u.get("inbound_id") if u.get("inbound_id") and not is_node_control_inbound(u.get("inbound_id")) else None)
-        cfg = generate_user_config(user_id, u, fallback_iid) if fallback_iid else ""
+        cfg = generate_user_config(user_id, u, fallback_iid, request_host=request_host) if fallback_iid else ""
         if cfg:
             configs.append(cfg)
     content = base64.b64encode("\n".join(configs).encode()).decode()
@@ -6339,7 +6401,7 @@ async def api_user_sub(uuid_key: str, _=Depends(require_auth)):
 
 
 @app.get("/api/sub-by-hash/{sub_hash}")
-async def api_sub_by_hash(sub_hash: str):
+async def api_sub_by_hash(sub_hash: str, request: Request):
     """Subscription data by unguessable hash — the public API sub.html uses.
 
     The hash itself is the secret; knowing it is the only requirement.
@@ -6350,7 +6412,7 @@ async def api_sub_by_hash(sub_hash: str):
     if rec is None or rec.get("revoked"):
         raise HTTPException(status_code=404, detail="subscription not found")
     try:
-        return await _build_subscription_data_by_uuid(rec["config_uuid"])
+        return await _build_subscription_data_by_uuid(rec["config_uuid"], request_host=get_request_host(request))
     except HTTPException:
         raise HTTPException(status_code=404, detail="subscription not found")
 
