@@ -58,6 +58,8 @@ app = FastAPI(title="Panel", docs_url=None, redoc_url=None)
 # Import and include xhttp_siz10 router - deferred until globals are defined
 xhttp_router = None
 
+PANEL_PORT = 8080
+
 CONFIG = {
     # The panel must always listen on 8080 (the user's VPN clients and any
     # Railway TCP relay expect this port). Never let a PORT env var override it.
@@ -245,6 +247,12 @@ async def load_state():
                 CONFIG["secret"] = data["saved_secret"]
             if "settings" in data:
                 SETTINGS.update(data["settings"])
+            if isinstance(data.get("worker"), dict):
+                # Preserve connected=True state from saved state; don't let startup logic reset it.
+                was_connected = data["worker"].get("connected", False)
+                WORKER.update(data["worker"])
+                if was_connected:
+                    WORKER["connected"] = True
             # Accept both the current nested settings format and the canonical
             # top-level state keys used by the Node replication architecture.
             if data.get("panel_api_key"):
@@ -338,7 +346,7 @@ def _migrate_user_uuids():
     """Migrate legacy 32-char (bare-hex) config UUIDs to proper hyphenated UUIDs.
 
     Old generate_uuid() returned secrets.token_hex(16) with no dashes, which VLESS
-    clients reject. This rekeys the user,
+    clients and the worker's uuid validation both reject. This rekeys the user,
     its stored path, the synced link, and PATH_INDEX to a valid UUID.
     """
     migrated = 0
@@ -446,6 +454,7 @@ async def _save_state_now():
                 "groups": dict(GROUPS),
                 "inbounds": dict(INBOUNDS),
                 "shared_configs": dict(SHARED_CONFIGS),
+                "worker": dict(WORKER),
                 "ip_pool": list(IP_POOL),
                 "ip_blacklist": list(IP_BLACKLIST),
                 "nodes": dict(NODES),
@@ -609,6 +618,61 @@ IP_BLACKLIST_LOCK = asyncio.Lock()
 # ── IP per user tracking ───────────────────────────────────────────────────
 USER_IP_MAP: dict = defaultdict(set)  # user_id → set of IPs used
 USER_IP_MAP_LOCK = asyncio.Lock()
+
+
+# ── Cloudflare Worker manager ──────────────────────────────────────────────
+# Railway only hosts the panel; user traffic flows Client → Worker → Proxy IP.
+# The API token lives ONLY here (server-side, persisted to /data state), never
+# sent to the frontend. `proxies` maps a country code → {country, proxy, port}.
+WORKER: dict = {
+    "connected": False,
+    "account_id": "",
+    "worker_name": "",
+    "worker_domain": "",
+    "worker_url": "",
+    "pages_project_name": "",
+    "pages_project_id": "",
+    "pages_url": "",
+    "token": "",
+    # Cloudflare auth email (for Global API Key auth: cfk_... tokens).
+    # Control token: a random secret baked into the deployed worker. The panel
+    # uses it to call the worker's admin API (update proxy map, etc.) after
+    # deploy — the worker only accepts calls carrying this Bearer token.
+    "control_token": "",
+    # Panel domain injected into the worker so it can expose panel info.
+    "panel_domain": "",
+    # KV namespace id + title for the worker's dedicated SPIDER_KV binding
+    # ({worker_name}-db — one namespace per worker, never shared).
+    "kv_namespace_id": "",
+    "kv_namespace_title": "",
+    # Remote-control status pulled from the worker's /panel/status API.
+    "remote_status": "",
+    "last_heartbeat": "",
+    "worker_users_online": 0,
+    "worker_traffic_bytes": 0,
+    "worker_user_count": 0,
+    "proxies": {},
+    "last_sync": "",
+    "last_error": "",
+    "source_url": "https://raw.githubusercontent.com/NiREvil/vless/main/sub/ProxyIP-Daily.md",
+    "auto_sync": True,
+    "sync_error": "",
+    "sync_count": 0,
+    "routing_status": {},
+    # Tunnel: dedicated KV + inbound (user → Railway → Worker → site)
+    "tunnel_kv_namespace_id": "",
+    "tunnel_kv_namespace_title": "",
+    "tunnel_enabled": False,
+    "tunnel_created_at": "",
+    "tunnel_logs": [],
+    # Reverse: dedicated KV + mode flag (user → Worker → Railway → site)
+    "reverse_kv_namespace_id": "",
+    "reverse_kv_namespace_title": "",
+}
+WORKER_LOCK = asyncio.Lock()
+# Serialize source syncs (hourly loop + manual button can't overlap).
+WORKER_SYNC_LOCK = asyncio.Lock()
+
 
 
 # ── Telegram Proxy Instances ────────────────────────────────────────────────
@@ -994,7 +1058,7 @@ _MYSQL_SYSTEM_DBS = {"information_schema", "mysql", "performance_schema", "sys",
 DB_GATE: dict = {
     "active": True,          # True → panel locked (setup page only)
     "configured": False,
-    "mode": "",              # "direct" | "manager"
+    "mode": "",              # "direct" | "manager" | "local"
     "url": "",
     "database": "",
     "connected": False,
@@ -1021,6 +1085,8 @@ def _db_boot_load() -> dict | None:
             if cfg.get("host") and cfg.get("user") and cfg.get("database"):
                 return cfg
             return None
+        if cfg.get("mode") == "local":
+            return cfg
         if cfg.get("url") and cfg.get("database") and cfg.get("api_key"):
             return cfg
     except Exception:
@@ -1280,7 +1346,7 @@ def _reset_state_memory() -> None:
     """Clear every in-memory state container before re-loading from remote."""
     for d in (LINKS, SUBS, USERS, SETTINGS, GROUPS, INBOUNDS, NODES,
               PENDING_NODE_DELETIONS, SUB_HASH_INDEX, SUB_HASH_RECORDS,
-              CURRENT_SUB_HASH):
+              CURRENT_SUB_HASH, WORKER):
         d.clear()
     IP_POOL.clear()
     IP_BLACKLIST.clear()
@@ -1296,6 +1362,11 @@ async def _database_gate_boot() -> None:
         logger.warning("No data server configured — panel is LOCKED until a database is set up")
         return
     try:
+        if boot.get("mode") == "local":
+            DB_GATE.update(active=False, configured=True, mode="local", url="", database="local",
+                           connected=True, error="")
+            logger.info("Local database mode — state kept in %s", DATA_FILE)
+            return
         if boot.get("mode") == "direct":
             DB_GATE.update(configured=True, mode="direct", url=f"mysql://{boot['host']}:{boot.get('port', 3306)}",
                            database=boot["database"])
@@ -1327,7 +1398,7 @@ async def _database_gate_boot() -> None:
 
 def _db_schedule_push(payload: str) -> None:
     global _db_push_pending
-    if DB_GATE["active"] or not DB_GATE["configured"]:
+    if DB_GATE["active"] or not DB_GATE["configured"] or DB_GATE.get("mode") == "local":
         return
     _db_push_pending = payload
     if not _db_push_lock.locked():
@@ -1390,6 +1461,10 @@ button.go{width:100%;border:0;cursor:pointer;background:#00e1c1;color:#04110e;fo
 font-size:14.5px;padding:13px;border-radius:12px;font-family:inherit;transition:filter .2s}
 button.go:hover{filter:brightness(1.08)}
 button.go:disabled{filter:grayscale(.4);cursor:wait}
+button.skip{width:100%;margin-top:10px;border:1px solid #313136;cursor:pointer;background:transparent;color:#9a9aa5;
+font-weight:700;font-size:13px;padding:11px;border-radius:12px;font-family:inherit;transition:all .2s}
+button.skip:hover{border-color:#00e1c1;color:#00e1c1}
+button.skip:disabled{cursor:wait;opacity:.6}
 .hint{margin-top:16px;font-size:11px;color:#6b6b76;line-height:2;text-align:center}
 .hint code{direction:ltr;display:inline-block;background:#1d1d22;padding:1px 7px;border-radius:6px}
 </style>
@@ -1398,7 +1473,7 @@ button.go:disabled{filter:grayscale(.4);cursor:wait}
 <div class="card">
   <div class="logo">VPN</div>
   <h1>اتصال به دیتابیس</h1>
-  <p class="sub">این پنل بدون دیتابیس خارجی کار نمی‌کند.<br>همه اطلاعات (کاربران، تنظیمات، لینک‌ها) در MySQL ذخیره می‌شود.</p>
+  <p class="sub">اطلاعات پنل در MySQL خارجی یا فایل لوکال ذخیره می‌شود.<br>بدون دیتابیس، پنل قفل می‌ماند.</p>
   <div class="tabs">
     <button type="button" class="tab on" id="tab-direct" onclick="setMode('direct')">اتصال مستقیم MySQL</button>
     <button type="button" class="tab" id="tab-manager" onclick="setMode('manager')">سرور داده (API)</button>
@@ -1439,6 +1514,7 @@ button.go:disabled{filter:grayscale(.4);cursor:wait}
     </div>
     <button class="go" id="btn" type="submit">اتصال و راه‌اندازی</button>
   </form>
+  <button class="skip" id="btn-skip" type="button" onclick="skipLocal()">رد شدن — استفاده از دیتابیس لوکال</button>
   <p class="hint">حالت مستقیم با هر هاست MySQL کار می‌کند <code>HidenCloud</code> و مشابه آن — اسم دیتابیس را ندارید؟ خالی بگذارید.</p>
 </div>
 <script>
@@ -1452,6 +1528,19 @@ function setMode(m){
   document.getElementById('err').style.display='none';
 }
 function v(id){return document.getElementById(id).value.trim();}
+async function skipLocal(){
+  var err=document.getElementById('err'), btn=document.getElementById('btn-skip');
+  err.style.display='none'; btn.disabled=true; btn.textContent='در حال فعال‌سازی دیتابیس لوکال...';
+  try{
+    var r=await fetch('/api/db-setup',{method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'local'})});
+    var d=await r.json();
+    if(r.ok&&d.ok){btn.textContent='فعال شد ✓';
+      setTimeout(function(){location.href=d.base||'/spider';},700);return;}
+    err.textContent=d.detail||'فعال‌سازی ناموفق بود';err.style.display='block';
+  }catch(e){err.textContent='ارتباط با پنل برقرار نشد';err.style.display='block';}
+  btn.disabled=false;btn.textContent='رد شدن — استفاده از دیتابیس لوکال';
+}
 async function connect(ev){
   ev.preventDefault();
   var err=document.getElementById('err'), btn=document.getElementById('btn');
@@ -1517,6 +1606,22 @@ async def api_db_setup(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="bad request")
     mode = str(body.get("mode") or ("direct" if body.get("mysql_user") else "manager")).strip()
+
+    if mode == "local":
+        # Skip: run on the local JSON database (DATA_FILE). No MySQL needed.
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = DB_BOOT_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"mode": "local"}, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(DB_BOOT_FILE)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"could not save local mode: {exc}")
+        DB_GATE.update(active=False, configured=True, mode="local", url="", database="local",
+                       connected=True, error="")
+        await load_state()
+        await _db_unlock_bringup()
+        log_activity("system", "دیتابیس لوکال فعال شد (حالت skip)", "ok")
+        return {"ok": True, "base": _admin_base(), "database": "local"}
 
     if mode == "direct":
         try:
@@ -1793,6 +1898,32 @@ async def startup():
                 _nib["node_ids"] = list(dict.fromkeys(current_ids))
                 for _obsolete in ("port", "network", "security", "domain", "external_domain", "external_port", "sni", "reality_settings", "xhttp_settings"):
                     _nib.pop(_obsolete, None)
+        # Any deployed Cloudflare Worker domain (address/host/sni auto-filled),
+        # with BPB snispoofing. Only created once a worker is actually connected.
+        has_worker = any((ib.get("protocol") or "").lower() == "worker" for ib in INBOUNDS.values())
+        _wdom_now = _worker_safe_domain(WORKER.get("worker_domain"))
+        if not has_worker and _wdom_now:
+            INBOUNDS["default-worker"] = {
+                "name": "Worker (Multi-Location)",
+                "protocol": "worker",
+                "port": 443,
+                "network": "ws",
+                "security": "tls",
+                "domain": _wdom_now,
+                "external_domain": _wdom_now,
+                "sni": "www.hcaptcha.com",
+                "spoof_ip": "8.6.112.4",
+                "external_port": 443,
+                "fingerprint": "chrome",
+                "reality_settings": {},
+                "xhttp_settings": {},
+                "ws_settings": {"path": "/ws/{uuid}"},
+                "grpc_settings": {},
+                "created_at": datetime.now().isoformat(),
+            }
+            asyncio.create_task(save_state())
+            log_activity("inbound", "اینباند پیش‌فرض Worker ساخته شد", "ok")
+
 
     if normalize_relay_links():
         await save_state()
@@ -1862,7 +1993,8 @@ async def startup():
                 _ib["domain"] = _real
                 _changed = True
             # For TLS WS/XHTTP inbounds: external_domain should be empty (panel domain used via SETTINGS["domain"])
-            if _cext in ("", "0.0.0.0", "127.0.0.1", "localhost", "SERVER_IP"):
+            # For Worker inbounds: external_domain should be the worker domain (set by _ensure_worker_inbound)
+            if _proto != "worker" and _cext in ("", "0.0.0.0", "127.0.0.1", "localhost", "SERVER_IP"):
                 _ib["external_domain"] = ""
                 _changed = True
     if _changed:
@@ -1876,7 +2008,7 @@ async def startup():
     _seen_ports[_panel_port] = "panel"
     for _iid, _ib in INBOUNDS.items():
         _proto = (_ib.get("protocol") or "").lower()
-        if _proto == "node" or _ib.get("system") is True:
+        if _proto == "node" or _ib.get("system") is True or _proto == "worker":
             continue
         if _proto not in {"reality", "telegram"} and (_ib.get("security") or "").lower() != "reality":
             continue
@@ -1977,7 +2109,7 @@ async def startup():
     for _ib in INBOUNDS.values():
         _proto = (_ib.get("protocol") or "").lower()
         _sec = (_ib.get("security") or "").lower()
-        if _proto == "reality" or _sec == "reality":
+        if _proto == "worker" or _proto == "reality" or _sec == "reality":
             continue
         if int(_ib.get("port") or 0) != _relay_port:
             _ib["port"] = _relay_port
@@ -1986,8 +2118,13 @@ async def startup():
     if _changed:
         asyncio.create_task(save_state())
 
+    # If a worker is connected, make sure the default Worker inbound exists and
+    # points at the worker domain (address/host/sni auto-filled at boot too).
+    if WORKER.get("connected"):
+        await _ensure_worker_inbound()
+
     # User path migration: each user's path must match their WS inbound. A user
-    # who has a WS inbound must have path /ws/{config_uuid} so the
+    # who has a WS (or worker) inbound must have path /ws/{config_uuid} so the
     # FastAPI relay (/ws/{uuid}) can tunnel it. Old users created when reality
     # was the primary inbound may carry /xhttp-siz10/... paths that break WS.
     _up_changed = False
@@ -2040,6 +2177,11 @@ async def startup():
     global xhttp_router
     # router is already defined in this module
     app.include_router(router)
+    global PUBLIC_ENDPOINT_TASK
+    if PUBLIC_ENDPOINT_TASK is None or PUBLIC_ENDPOINT_TASK.done():
+        PUBLIC_ENDPOINT_TASK = asyncio.create_task(_public_endpoint_resolver_loop())
+    asyncio.create_task(_worker_proxy_sync_loop())
+    asyncio.create_task(_worker_auto_sync_loop())
     asyncio.create_task(_xray_client_audit_loop())
 
     # Start Telegram management/subscription bot (long-polling)
@@ -2187,9 +2329,73 @@ async def _sync_tg_traffic(user_id: str, nbytes: int):
     except Exception:
         pass
 
+
+# Worker proxy source sync — hourly pull from the daily GitHub list and push to
+# the deployed Cloudflare Worker (Railway is the control plane; the Worker gets
+# a fresh country → proxy map without the user doing anything).
+WORKER_SYNC_INTERVAL = int(os.environ.get("WORKER_SYNC_INTERVAL", 3600))  # seconds
+
+
+async def _worker_proxy_sync_loop():
+    """Background loop: every hour, if the worker is connected and auto-sync is
+    on, fetch the daily proxy source, parse it into country → proxy and re-deploy
+    the worker. Failures are recorded and retried next tick."""
+    # First tick quickly so the panel starts with fresh proxies.
+    await asyncio.sleep(30)
+    while True:
+        try:
+            if WORKER.get("connected"):
+                if WORKER.get("auto_sync"):
+                    await _sync_worker_proxies_from_source()
+                # Worker owns runtime traffic counters; pull them back to Railway
+                # so the panel dashboard/subscription always reflects reality.
+                await _worker_pull_all_users()
+        except Exception as e:
+            logger.warning(f"worker sync failed: {e}")
+        await asyncio.sleep(min(WORKER_SYNC_INTERVAL, 30))
+
+WORKER_AUTO_SYNC_INTERVAL = int(os.environ.get("WORKER_AUTO_SYNC_INTERVAL", 300))  # seconds
+
+async def _worker_auto_sync_loop():
+    """Background loop: keeps panel and worker in sync without any manual action.
+
+    Every WORKER_AUTO_SYNC_INTERVAL seconds (default 5 min), while a worker is
+    connected:
+      1. push users/routes/settings → worker (POST /panel/config),
+      2. pull live usage + worker-generated configs back (GET /api/user/{uuid}),
+      3. refresh the remote status/heartbeat shown in the Worker tab.
+    Failures (e.g. KV daily limit) are logged and retried next tick."""
+    await asyncio.sleep(20)  # let startup finish
+    while True:
+        try:
+            if WORKER.get("connected"):
+                push = await _worker_push_config()
+                if not push.get("ok"):
+                    logger.warning(f"worker auto-push failed: {push.get('detail')}")
+                await _worker_pull_all_users()
+                await _worker_pull_status()
+        except Exception as e:
+            logger.warning(f"worker auto-sync failed: {e}")
+        await asyncio.sleep(WORKER_AUTO_SYNC_INTERVAL)
+
 @app.on_event("shutdown")
 async def shutdown():
     global NODE_HEARTBEAT_TASK, _db_http
+    global PUBLIC_ENDPOINT_TASK, PUBLIC_ENDPOINT_WORKER_SYNC_TASK
+    if PUBLIC_ENDPOINT_WORKER_SYNC_TASK is not None and not PUBLIC_ENDPOINT_WORKER_SYNC_TASK.done():
+        PUBLIC_ENDPOINT_WORKER_SYNC_TASK.cancel()
+        try:
+            await PUBLIC_ENDPOINT_WORKER_SYNC_TASK
+        except asyncio.CancelledError:
+            pass
+        PUBLIC_ENDPOINT_WORKER_SYNC_TASK = None
+    if PUBLIC_ENDPOINT_TASK is not None and not PUBLIC_ENDPOINT_TASK.done():
+        PUBLIC_ENDPOINT_TASK.cancel()
+        try:
+            await PUBLIC_ENDPOINT_TASK
+        except asyncio.CancelledError:
+            pass
+        PUBLIC_ENDPOINT_TASK = None
     if _db_http is not None and not _db_http.is_closed:
         try:
             await _db_http.aclose()
@@ -2230,17 +2436,31 @@ async def shutdown():
 def get_host() -> str:
     """Public host used for generated configs/links.
 
-    Priority: RAILWAY_PUBLIC_DOMAIN env → admin-set domain →
-    last host the panel was actually opened with (auto-captured from
-    incoming requests, persisted) → configured fallback.
+    Priority: operator-set domain (manual) → platform/deployer environment →
+    previously discovered host → last host the panel was actually opened
+    with (auto-captured) → configured fallback. Never returns localhost.
     """
-    for cand in (os.environ.get("RAILWAY_PUBLIC_DOMAIN"),
-                 SETTINGS.get("domain"),
-                 SETTINGS.get("auto_host")):
-        cleaned = _clean_host(cand)
-        if cleaned:
-            return cleaned
+    try:
+        endpoint, source = _choose_public_endpoint()
+    except Exception:
+        endpoint, source = None, ""
+    if endpoint:
+        try:
+            current_source = str(PUBLIC_ENDPOINT.get("source") or "")
+            current_host = str(PUBLIC_ENDPOINT.get("host") or "")
+            if not (current_host
+                    and current_source.startswith("request:")
+                    and source.startswith("platform-env:")
+                    and endpoint["host"] != current_host):
+                _apply_public_endpoint(endpoint, source)
+        except Exception:
+            pass
+        return str(endpoint.get("host") or "").strip()
+    cleaned = _clean_host(SETTINGS.get("auto_host"))
+    if cleaned:
+        return cleaned
     return CONFIG["host"]
+
 
 
 def _clean_host(*candidates) -> str:
@@ -2287,6 +2507,409 @@ def get_request_host(request) -> str:
         return _clean_host(first, direct)
     except Exception:
         return ""
+
+PUBLIC_ENDPOINT_LOCK = asyncio.Lock()
+PUBLIC_ENDPOINT_TASK = None
+PUBLIC_ENDPOINT_WORKER_SYNC_TASK = None
+PUBLIC_ENDPOINT = {
+    "host": "",
+    "scheme": "https",
+    "port": 443,
+    "url": "",
+    "source": "",
+    "ready": False,
+    "attempts": 0,
+    "last_checked_at": "",
+    "last_error": "",
+}
+try:
+    PUBLIC_ENDPOINT_RETRY_SECONDS = max(
+        3.0, float(os.environ.get("PUBLIC_ENDPOINT_RETRY_SECONDS", "5") or "5")
+    )
+except ValueError:
+    PUBLIC_ENDPOINT_RETRY_SECONDS = 5.0
+try:
+    PUBLIC_ENDPOINT_REFRESH_SECONDS = max(
+        15.0, float(os.environ.get("PUBLIC_ENDPOINT_REFRESH_SECONDS", "60") or "60")
+    )
+except ValueError:
+    PUBLIC_ENDPOINT_REFRESH_SECONDS = 60.0
+
+PUBLIC_ENDPOINT_ENV_VARS = (
+    "SPIDER_PANEL_PUBLIC_URL",
+    "SPIDER_PANEL_PUBLIC_DOMAIN",
+    "PUBLIC_URL",
+    "PUBLIC_DOMAIN",
+    "PUBLIC_HOST",
+    "APP_URL",
+    "APP_DOMAIN",
+    "EXTERNAL_URL",
+    "EXTERNAL_DOMAIN",
+    "SERVICE_URL",
+    "SERVICE_DOMAIN",
+    "RENDER_EXTERNAL_URL",
+    "RENDER_EXTERNAL_HOSTNAME",
+    "KOYEB_PUBLIC_DOMAIN",
+    "RAILWAY_PUBLIC_DOMAIN",
+    "RAILWAY_STATIC_URL",
+    "VERCEL_URL",
+    "VERCEL_BRANCH_URL",
+    "NETLIFY_URL",
+    "DEPLOY_PRIME_URL",
+    "URL",
+    "REPLIT_DEV_DOMAIN",
+    "REPLIT_DOMAINS",
+    "HEROKU_APP_NAME",
+)
+
+def _is_placeholder_host(host: str) -> bool:
+    h = str(host or "").strip().lower().strip("[]").rstrip(".")
+    return h in {
+        "",
+        "localhost",
+        "localhost.localdomain",
+        "0.0.0.0",
+        "127.0.0.1",
+        "::1",
+        "server_ip",
+        "server-ip",
+    } or h.endswith((".localhost", ".local", ".internal", ".svc", ".cluster.local"))
+
+def _is_public_host(host: str) -> bool:
+    """Return True for a plausible public DNS name or globally routable IP."""
+    import ipaddress
+
+    h = str(host or "").strip().strip("[]").rstrip(".")
+    if not h or _is_placeholder_host(h):
+        return False
+
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return "." in h and " " not in h
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+def _normalize_public_endpoint(raw: str, default_scheme: str = "https") -> dict | None:
+    """Normalize a URL/host[:port] into a safe public endpoint record."""
+    from urllib.parse import urlsplit
+
+    value = str(raw or "").strip().strip("`'\"")
+    if not value:
+        return None
+
+    if "," in value and "://" not in value:
+        value = next((x.strip() for x in value.split(",") if x.strip()), "")
+    if not value:
+        return None
+
+    if "://" not in value:
+        value = f"{default_scheme}://{value}"
+
+    try:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").strip().rstrip(".")
+        scheme = (parsed.scheme or default_scheme).lower()
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+
+    if not _is_public_host(host):
+        return None
+    if scheme not in ("http", "https"):
+        scheme = default_scheme if default_scheme in ("http", "https") else "https"
+    if port is None:
+        port = 443 if scheme == "https" else 80
+
+    default_port = 443 if scheme == "https" else 80
+    url = f"{scheme}://{host}" + (f":{port}" if port != default_port else "")
+    return {"host": host, "scheme": scheme, "port": int(port), "url": url}
+
+def _deployer_env_candidates() -> list[tuple[str, str, str]]:
+    """Return (raw_value, source, variable_name) candidates."""
+    out = []
+
+    # Explicit SpiderPanel configuration wins over provider defaults.
+    for var in ("SPIDER_PANEL_PUBLIC_URL", "SPIDER_PANEL_PUBLIC_DOMAIN"):
+        val = str(os.environ.get(var) or "").strip()
+        if val:
+            out.append((val, "spider-env", var))
+
+    # Provider-native values. These are intentionally independent of Railway.
+    provider_vars = (
+        "RENDER_EXTERNAL_URL",
+        "RENDER_EXTERNAL_HOSTNAME",
+        "KOYEB_PUBLIC_DOMAIN",
+        "RAILWAY_PUBLIC_DOMAIN",
+        "RAILWAY_STATIC_URL",
+        "VERCEL_URL",
+        "VERCEL_BRANCH_URL",
+        "NETLIFY_URL",
+        "DEPLOY_PRIME_URL",
+        "URL",
+        "REPLIT_DEV_DOMAIN",
+        "REPLIT_DOMAINS",
+        "HEROKU_APP_NAME",
+    )
+    for var in provider_vars:
+        val = str(os.environ.get(var) or "").strip()
+        if val:
+            if var == "HEROKU_APP_NAME":
+                val = f"https://{val}.herokuapp.com"
+            out.append((val, "platform-env", var))
+
+    # Generic names cover platforms that do not expose a canonical variable.
+    for var in (
+        "PUBLIC_URL",
+        "PUBLIC_DOMAIN",
+        "PUBLIC_HOST",
+        "APP_URL",
+        "APP_DOMAIN",
+        "EXTERNAL_URL",
+        "EXTERNAL_DOMAIN",
+        "SERVICE_URL",
+        "SERVICE_DOMAIN",
+    ):
+        val = str(os.environ.get(var) or "").strip()
+        if val:
+            out.append((val, "platform-env", var))
+
+    # Fly.io: the default public hostname is deterministic from FLY_APP_NAME.
+    fly_name = str(os.environ.get("FLY_APP_NAME") or "").strip()
+    if fly_name:
+        out.append((f"https://{fly_name}.fly.dev", "platform-env", "FLY_APP_NAME"))
+
+    # GitHub Codespaces: public forwarded-port hostname.
+    cs_name = str(os.environ.get("CODESPACE_NAME") or "").strip()
+    cs_suffix = str(os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN") or "").strip()
+    if cs_name and cs_suffix:
+        out.append((
+            f"https://{cs_name}-{_env_port()}.{cs_suffix}",
+            "platform-env",
+            "GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN",
+        ))
+
+    return out
+
+def _env_port(default: int = PANEL_PORT) -> int:
+    """Return the canonical SpiderPanel listen port.
+
+    Provider-injected PORT values are intentionally ignored. The panel itself
+    always listens on 8080; a platform reverse proxy may still expose another
+    public port/domain in front of it.
+    """
+    return PANEL_PORT
+
+def _request_endpoint_candidates(request: Request) -> list[tuple[str, str, str]]:
+    """Read the external endpoint reflected by a reverse proxy/request."""
+    candidates = []
+
+    forwarded = str(request.headers.get("forwarded") or "").strip()
+    if forwarded:
+        first = forwarded.split(",", 1)[0]
+        host_match = re.search(r"(?:^|;)\s*host=([^;]+)", first, re.I)
+        proto_match = re.search(r"(?:^|;)\s*proto=([^;]+)", first, re.I)
+        if host_match:
+            raw_host = host_match.group(1).strip().strip("\"")
+            proto = proto_match.group(1).strip().strip("\"") if proto_match else "https"
+            candidates.append((f"{proto}://{raw_host}", "request", "Forwarded"))
+
+    forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+    if forwarded_proto not in ("http", "https"):
+        forwarded_proto = "https" if request.url.scheme == "https" else "http"
+
+    for header in ("x-forwarded-host", "host"):
+        raw = str(request.headers.get(header) or "").strip()
+        if raw:
+            candidates.append((f"{forwarded_proto}://{raw}", "request", header))
+
+    try:
+        if request.base_url:
+            candidates.append((str(request.base_url), "request", "base_url"))
+    except Exception:
+        pass
+
+    return candidates
+
+def _saved_public_endpoint() -> dict | None:
+    raw = str(SETTINGS.get("domain") or CONFIG.get("host") or "").strip()
+    endpoint = _normalize_public_endpoint(raw)
+    if endpoint:
+        endpoint["source"] = "saved"
+        return endpoint
+    return None
+
+def _apply_public_endpoint(endpoint: dict, source: str) -> bool:
+    """Publish a newly discovered endpoint into runtime state."""
+    global PUBLIC_ENDPOINT
+
+    host = endpoint["host"]
+    old_host = str(PUBLIC_ENDPOINT.get("host") or "")
+    old_source = str(PUBLIC_ENDPOINT.get("source") or "")
+
+    # A manually configured domain is authoritative.
+    if str(SETTINGS.get("domain_source") or "") == "manual" and old_host and old_host != host:
+        return False
+
+    PUBLIC_ENDPOINT.update({
+        **endpoint,
+        "source": source,
+        "ready": True,
+        "last_error": "",
+    })
+    changed = old_host != host or old_source != source
+
+    if str(SETTINGS.get("domain") or "") != host:
+        SETTINGS["domain"] = host
+        changed = True
+    CONFIG["host"] = host
+    SETTINGS["domain_source"] = source.split(":", 1)[0]
+
+    # Keep derived panel-transport inbounds synchronized. Reality and Worker
+    # have independent external endpoints and must never be overwritten here.
+    for ib in INBOUNDS.values():
+        proto = str(ib.get("protocol") or "").lower()
+        sec = str(ib.get("security") or "").lower()
+        if proto == "worker" or proto == "reality" or sec == "reality":
+            continue
+        cur = str(ib.get("domain") or "").strip()
+        if not cur or _is_placeholder_host(cur) or cur == old_host:
+            if cur != host:
+                ib["domain"] = host
+                changed = True
+
+    worker_domain_changed = False
+    if WORKER.get("connected"):
+        panel_domain = str(WORKER.get("panel_domain") or "").strip()
+        if not panel_domain or _is_placeholder_host(panel_domain) or panel_domain == old_host:
+            if panel_domain != host:
+                WORKER["panel_domain"] = host
+                worker_domain_changed = True
+                changed = True
+
+    # The Worker source contains PANEL_DOMAIN as an injected constant. If the
+    # panel domain becomes known/changes after the Worker was already deployed,
+    # schedule exactly one redeploy so the Worker stays in sync.
+    if worker_domain_changed:
+        try:
+            global PUBLIC_ENDPOINT_WORKER_SYNC_TASK
+            if PUBLIC_ENDPOINT_WORKER_SYNC_TASK is None or PUBLIC_ENDPOINT_WORKER_SYNC_TASK.done():
+                PUBLIC_ENDPOINT_WORKER_SYNC_TASK = asyncio.create_task(_worker_deploy())
+        except (NameError, RuntimeError):
+            pass
+
+    return changed
+
+async def _discover_public_endpoint(request: Request | None = None) -> bool:
+    """Try portable sources once; never fall back to localhost."""
+    try:
+        candidates = _deployer_env_candidates()
+        if request is not None:
+            # A real external request is the strongest portable signal for
+            # custom domains, so put it ahead of generic provider fallbacks.
+            candidates = _request_endpoint_candidates(request) + candidates
+
+        saved = _saved_public_endpoint()
+        if saved:
+            candidates.append((saved["url"], "saved", "state"))
+
+        endpoint = None
+        source = ""
+        current_host = str(PUBLIC_ENDPOINT.get("host") or "")
+        current_source = str(PUBLIC_ENDPOINT.get("source") or "")
+
+        for raw, src, label in candidates:
+            ep = _normalize_public_endpoint(raw)
+            if not ep:
+                continue
+
+            # Once a custom/request domain is known, do not flap back to a
+            # provider hostname on every resolver tick.
+            if current_host and current_source.startswith("request:") and src == "platform-env":
+                if ep["host"] != current_host:
+                    continue
+
+            ep["source"] = f"{src}:{label}"
+            endpoint, source = ep, ep["source"]
+            break
+
+        async with PUBLIC_ENDPOINT_LOCK:
+            PUBLIC_ENDPOINT["attempts"] = int(PUBLIC_ENDPOINT.get("attempts") or 0) + 1
+            PUBLIC_ENDPOINT["last_checked_at"] = datetime.now().isoformat(timespec="seconds")
+
+        if endpoint:
+            changed = _apply_public_endpoint(endpoint, source)
+            if changed:
+                logger.info("Public endpoint discovered: %s (source=%s)", endpoint["url"], source)
+                try:
+                    asyncio.create_task(save_state())
+                except RuntimeError:
+                    pass
+            return True
+
+        async with PUBLIC_ENDPOINT_LOCK:
+            PUBLIC_ENDPOINT["ready"] = False
+            PUBLIC_ENDPOINT["last_error"] = "No public domain has been exposed yet"
+        return False
+    except Exception as exc:
+        async with PUBLIC_ENDPOINT_LOCK:
+            PUBLIC_ENDPOINT["last_error"] = str(exc)
+        logger.debug("Public endpoint discovery failed: %s", exc)
+        return False
+
+async def _public_endpoint_resolver_loop():
+    """Keep checking until a public endpoint exists and refresh periodically."""
+    while True:
+        try:
+            ready = await _discover_public_endpoint()
+            await asyncio.sleep(
+                PUBLIC_ENDPOINT_REFRESH_SECONDS if ready else PUBLIC_ENDPOINT_RETRY_SECONDS
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Public endpoint resolver loop error: %s", exc)
+            await asyncio.sleep(PUBLIC_ENDPOINT_RETRY_SECONDS)
+
+def _choose_public_endpoint(request: Request | None = None) -> tuple[dict | None, str]:
+    # A domain explicitly entered by the operator must stay authoritative and
+    # must not be replaced by a provider hostname discovered later.
+    if str(SETTINGS.get("domain_source") or "") == "manual":
+        manual = _saved_public_endpoint()
+        if manual:
+            manual["source"] = "manual:settings"
+            return manual, "manual:settings"
+
+    candidates = _deployer_env_candidates()
+    if request is not None:
+        candidates = _request_endpoint_candidates(request) + candidates
+
+    saved = _saved_public_endpoint()
+    if saved:
+        candidates.append((saved["url"], "saved", "state"))
+
+    for raw, src, label in candidates:
+        endpoint = _normalize_public_endpoint(raw)
+        if endpoint:
+            return endpoint, f"{src}:{label}"
+    return None, ""
+
+def get_public_endpoint() -> dict:
+    """Return the known public endpoint without inventing localhost."""
+    endpoint = dict(PUBLIC_ENDPOINT)
+    host = str(endpoint.get("host") or get_host() or "").strip()
+    if host:
+        endpoint["host"] = host
+        if not endpoint.get("url"):
+            endpoint["url"] = f"https://{host}"
+        endpoint["ready"] = True
+    return endpoint
 
 DEFAULT_TLS_WS_INBOUND_NAME = "پیش‌فرض TLS + WS"
 LEGACY_TLS_WS_NAMES = {"VLESS+WS پیش‌فرض", "VLESS + WS پیش‌فرض", "پیش‌فرض VLESS+WS", "پیش‌فرض VLESS + WS"}
@@ -2585,7 +3208,11 @@ def generate_short_id() -> str:
 def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr: str = None, remark_tag: str = None, request_host: str = "") -> str:
     """Build a VLESS config string for one inbound of a user.
 
-    Three config families (one per inbound type):
+    Five config families (one per inbound type):
+      - Worker   → served by the managed Cloudflare Worker (multi-location);
+                   address/host/sni = worker domain, path /ws/{uuid}
+      - Tunnel   → user → panel → Worker → site (path /tunnel/{uuid}), or the
+                   reverse chain via the worker domain (/reverse/{uuid})
       - Reality  → served by Xray core (address/host/port/pbk/sid come from the
                    inbound's reality settings + external domain/port)
       - TLS WS/XHTTP → served by the FastAPI relay; address/host/sni = the
@@ -2623,6 +3250,13 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
         else:
             addr_ip, addr_port = addr, "443"
         addr_ip, addr_port = addr_ip.strip(), addr_port.strip()
+
+    # ── WORKER (multi-location via Cloudflare Worker) ──
+    if proto == "worker":
+        wcfgs = _worker_configs(user_id, user, inbound, "", remark_tag, addr_ip, addr_port)
+        if wcfgs:
+            return wcfgs[0]
+        return ""
 
     # ── TELEGRAM PROXY ──
     if proto == "telegram":
@@ -2699,6 +3333,30 @@ def generate_user_config(user_id: str, user: dict, inbound_id: str = None, addr:
     # ── TLS (WS default / XHTTP selectable) — served by the FastAPI relay ──
     # address/host/sni always = the panel main domain; port 443 (Railway TLS).
     panel_domain = _safe_host(SETTINGS.get("domain"), request_host, get_host())
+
+    # ── TUNNEL (user → Railway → CF Worker → site) — path /tunnel/{uuid} ──
+    if proto == "tunnel":
+        wdom = _worker_safe_domain(WORKER.get("worker_domain"))
+        if not wdom or not WORKER.get("connected"):
+            return ""
+        # Reverse switch ON: user → Worker → Railway → site. The config is
+        # addressed to the WORKER domain with path /reverse/{uuid} and the
+        # user's record lives in REVERSE_KV.
+        if inbound and inbound.get("reverse_enabled"):
+            rpath = f"/reverse/{config_uuid}"
+            params = ("encryption=none&security=tls&type=ws"
+                      f"&host={quote(wdom)}&path={quote(rpath, safe='')}&sni={quote(wdom)}"
+                      "&fp=chrome&alpn=http/1.1")
+            rev_rem = quote(f"{username} Reverse".strip())
+            return f"vless://{config_uuid}@{wdom}:443?{params}#{rev_rem}"
+        # Plain tunnel: user → Railway → Worker → site (path /tunnel/{uuid},
+        # addressed to the panel/Railway domain).
+        tpath = f"/tunnel/{config_uuid}"
+        params = ("encryption=none&security=tls&type=ws"
+                  f"&host={quote(panel_domain)}&path={quote(tpath, safe='')}&sni={quote(panel_domain)}"
+                  "&fp=chrome&alpn=http/1.1")
+        tun_rem = quote(f"{username} Tunnel".strip())
+        return f"vless://{config_uuid}@{panel_domain}:443?{params}#{tun_rem}"
 
     # The exact default TLS+WS inbound is the only inbound served by the FastAPI
     # WebSocket relay. Other inbounds must use their own stored transport/domain/port.
@@ -2876,7 +3534,7 @@ def generate_status_config(user: dict, configs: list, request_host: str = "") ->
                 if ib:
                     _p = (ib.get("protocol") or "").lower()
                     _s = (ib.get("security") or "").lower()
-                    if _p != "reality" and _s != "reality":
+                    if _p != "reality" and _s != "reality" and _p != "worker":
                         xs = ib.get("xhttp_settings") or {}
                         xpb = xs.get("xPaddingBytes", "100-1000")
                         xmode = str(xs.get("mode", "auto")).strip().lower()
@@ -2900,6 +3558,65 @@ def generate_status_config(user: dict, configs: list, request_host: str = "") ->
 
 # ── Default link ──────────────────────────────────────────────────────────────
 _default_link_created = False
+
+
+def _worker_configs(user_id: str, user: dict, inbound: dict, stored_path: str, base_remark: str, addr_ip: str = None, addr_port: str = None) -> list:
+    """Build one canonical VLESS/TCP/WS/TLS config for the managed Worker.
+
+    The Worker accepts exactly /ws/{UUID}; the same UUID is embedded in the
+    VLESS user-id and in the KV record pushed by the panel. Never invent a
+    second UUID or reuse a legacy bare-hex identifier here.
+    """
+    wdomain = _worker_safe_domain(WORKER.get("worker_domain"))
+    if not wdomain:
+        return []
+
+    cfg_uuid = str(user.get("config_uuid") or "").strip().lower()
+    if not _is_valid_uuid(cfg_uuid):
+        logger.warning("worker config skipped: invalid config_uuid user=%s uuid=%s", user_id, cfg_uuid)
+        return []
+
+    # Default Worker endpoint is HTTPS/WSS on 443. A scanned Cloudflare IP
+    # may replace only the TCP connect address; TLS SNI/Host stay on the real
+    # Pages domain so the edge certificate and routing remain correct.
+    raw_port = ((inbound or {}).get("external_port") or (inbound or {}).get("port") or 443)
+    try:
+        wport = int(raw_port)
+    except Exception:
+        wport = 443
+    if not 1 <= wport <= 65535:
+        wport = 443
+
+    address = str(addr_ip or wdomain).strip()
+    try:
+        port = int(addr_port or wport)
+    except Exception:
+        port = wport
+    if not address or not (1 <= port <= 65535):
+        return []
+
+    # Canonical route shared by the generator, Worker and every subscription.
+    wpath = f"/ws/{cfg_uuid}"
+    uname = str(user.get("username") or user_id)
+    tag = str(base_remark or "").strip()
+    remark = quote(f"{uname}{(' ' + tag) if tag and tag != uname else ''}")
+
+    params = (
+        "encryption=none"
+        "&security=tls"
+        "&type=ws"
+        f"&host={quote(wdomain, safe='')}"
+        f"&path={quote(wpath, safe='')}"
+        f"&sni={quote(wdomain, safe='')}"
+        "&fp=chrome"
+        "&alpn=http%2F1.1"
+    )
+    return [f"vless://{cfg_uuid}@{address}:{port}?{params}#{remark}"]
+
+
+# ── Default link ──────────────────────────────────────────────────────────────
+_default_link_created = False
+
 
 async def ensure_default_link():
     global _default_link_created
@@ -2941,7 +3658,9 @@ _HIDDEN_TABS = """
 
 _SETTINGS_TOOLS = """
 <div id="copilot-settings-tools" class="panel" style="margin-top:14px">
-  <div class="panel-h"><span class="glow">IP و API Key</span></div>
+  <div class="panel-h"><span class="glow">Domain / IP / API Key</span></div>
+  <div class="set-row"><span class="set-lbl">Panel Domain</span><span id="copilot-panel-domain" dir="ltr">در انتظار دامنه عمومی...</span></div>
+  <div class="set-row"><span class="set-lbl">Domain Source</span><span id="copilot-domain-source" dir="ltr">pending</span></div>
   <div class="set-row"><span class="set-lbl">Public IP</span><span id="copilot-public-ip" dir="ltr">در حال دریافت...</span></div>
   <div class="set-row"><span class="set-lbl">API Key</span><code id="copilot-api-key" dir="ltr">--</code></div>
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
@@ -2954,7 +3673,7 @@ _SETTINGS_TOOLS = """
 <script>
 (function(){
   function authFetch(url, opts){ return fetch(url, opts || {}).then(function(r){
-    if(r.status === 401){ location.href='/login'; throw new Error('نشست منقضی شده است'); }
+    if(r.status === 401){ location.href=(window.ADMIN_LOGIN||'/login'); throw new Error('نشست منقضی شده است'); }
     return r;
   }); }
   function msg(t){ var e=document.getElementById('copilot-tools-message'); if(e)e.textContent=t; }
@@ -2971,18 +3690,41 @@ _SETTINGS_TOOLS = """
       msg('API Key ساخته شد و در تنظیمات ذخیره شد.');
     }).catch(function(e){msg(e.message || 'ساخت API Key ناموفق بود');});
   }
+  var domainPoll = null;
+  function loadPublicEndpoint(){
+    authFetch('/api/runtime/public-endpoint').then(function(r){return r.json()}).then(function(d){
+      var de=document.getElementById('copilot-panel-domain');
+      var se=document.getElementById('copilot-domain-source');
+      if(de) de.textContent=d.ready && d.host ? d.host : 'در انتظار دامنه عمومی...';
+      if(se) se.textContent=d.ready ? (d.source || 'discovered') : 'pending';
+      if(d.ready && domainPoll){ clearInterval(domainPoll); domainPoll=null; }
+      if(!d.ready) msg('دامنه عمومی هنوز منتشر نشده؛ پنل به‌صورت خودکار دوباره بررسی می‌کند.');
+    }).catch(function(e){ msg(e.message || 'بررسی دامنه ناموفق بود'); });
+  }
   document.addEventListener('DOMContentLoaded',function(){
     var ip=document.getElementById('copilot-refresh-ip'), key=document.getElementById('copilot-rotate-key'), copy=document.getElementById('copilot-copy-key');
     if(ip)ip.onclick=loadIp; if(key)key.onclick=loadKey;
     if(copy)copy.onclick=function(){var v=document.getElementById('copilot-api-key').textContent; navigator.clipboard.writeText(v).then(function(){msg('API Key کپی شد.');});};
     loadIp();
+    loadPublicEndpoint();
+    domainPoll = setInterval(loadPublicEndpoint, 5000);
   });
 })();
 </script>
 """
 
+@app.middleware
+
 @app.middleware("http")
 async def deployment_ui_fixes(request: Request, call_next):
+    # Every public request is a portable source of truth for custom domains.
+    # This runs before route handlers so config/subscription generation in the
+    # same request already sees the discovered host.
+    try:
+        await _discover_public_endpoint(request)
+    except Exception as exc:
+        logger.debug("Request public-endpoint discovery failed: %s", exc)
+
     response = await call_next(request)
     content_type = response.headers.get("content-type", "")
     if "text/html" not in content_type:
@@ -3021,6 +3763,23 @@ async def capture_public_host(request: Request, call_next):
 
 
 
+
+@app.get("/healthz")
+async def healthz():
+    """Provider-neutral health check endpoint; never blocks on public-domain discovery."""
+    return {
+        "ok": True,
+        "service": "SpiderPanel",
+        "port": CONFIG.get("port", 8080),
+        "public_domain_ready": bool(get_host()),
+    }
+
+
+@app.get("/api/runtime/public-endpoint")
+async def runtime_public_endpoint(request: Request):
+    """Expose discovery state so the UI/deployer can poll until a domain exists."""
+    await _discover_public_endpoint(request)
+    return get_public_endpoint()
 
 # ── Telegram Proxy Module (merged from telegram_proxy.py) ──
 def derive_secret_from_uuid(config_uuid: str, salt: str = "spider-tg-proxy") -> str:
@@ -3313,6 +4072,12 @@ async def _build_subscription_data_by_uuid(config_uuid: str, request_host: str =
             }
         raise HTTPException(status_code=404, detail="subscription not found")
 
+    if _user_uses_worker_inbound(user):
+        user = await _worker_pull_user(uid, user)
+        async with USERS_LOCK:
+            if uid in USERS:
+                USERS[uid].update(user)
+
     auto_check_user_expiry(user)
 
     expire_days = None
@@ -3444,6 +4209,8 @@ async def _build_subscription_data_by_uuid(config_uuid: str, request_host: str =
         "vless_link": config,
         "config": config,
         "configs": all_configs,
+        "worker_configs": list(user.get("worker_configs") or []),
+        "worker_countries": [],
         "shared_extra": shared_extra,
         "shared_count": len(_shared_all),
         "inbound_ids": inbound_ids,
@@ -3453,6 +4220,9 @@ async def _build_subscription_data_by_uuid(config_uuid: str, request_host: str =
         "concurrent_connections": user.get("concurrent_connections", 0),
         "server": user.get("server", ""),
         "proxy_ips": user.get("proxy_ips", []),
+        "proxy_country": "",
+        "proxy_countries": [],
+        "proxy_ip_enabled": user.get("proxy_ip_enabled", False),
         "max_ip_per_user": int(user.get("concurrent_connections") if user.get("concurrent_connections") is not None else 0),
         "used_ips": len(USER_IP_MAP.get(uid, set())),
     }
@@ -4347,6 +5117,35 @@ _PORTAL_HEADERS = {
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
+@app.get("/link/{uuid}")
+async def link_page(uuid: str, request: Request):
+    """Single public subscription URL (original-style UUID link).
+
+    Validates the user (disabled/expired → 410, like /sub) then redirects
+    to the hashed subscription URL, preserving format/view flags.
+    """
+    if DB_GATE["active"]:
+        raise HTTPException(status_code=503, detail="database_required")
+    try:
+        config_uuid = str(uuid.UUID(str(uuid).strip())).lower()
+    except Exception:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    accept = (request.headers.get("Accept") or "").lower()
+    ua = request.headers.get("User-Agent") or ""
+    try:
+        sub_data = await _build_subscription_data_by_uuid(config_uuid, request_host=get_request_host(request))
+    except HTTPException:
+        sub_data = None
+    if sub_data is None or not bool(sub_data.get("is_active", True)):
+        if _is_browser_ua(ua, accept):
+            return HTMLResponse(content=_sub_error_page(410), status_code=410)
+        return Response(content="This subscription link is no longer valid.", status_code=410,
+                        headers={"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"})
+    h = ensure_sub_hash(config_uuid)
+    qs = ("?" + str(request.url.query)) if request.url.query else ""
+    return RedirectResponse(url=f"/sub/{h}{qs}", status_code=307)
+
+
 @app.get("/sub/{sub_hash}")
 async def hashed_sub_route(sub_hash: str, request: Request):
     """`/sub/{hash}` — mirrors the worker's handleHashedSubRoute exactly."""
@@ -5039,7 +5838,88 @@ async def ws_uuid_handler(ws: WebSocket, uuid: str):
 
 
 
-logger.info("VLESS Relay module loaded (WS: /ws/{uuid})")
+# Tunnel path: /tunnel/{uuid} — user → Railway (here) → Cloudflare Worker → site.
+# Railway accepts the client's TLS+WS, then relays raw VLESS bytes to the Worker
+# over an outbound WSS connection to /{uuid} on the worker domain. The Worker
+# authenticates the user from its TUNNEL_KV and connects out to the target.
+@app.websocket("/tunnel/{uuid}")
+async def tunnel_ws_handler(ws: WebSocket, uuid: str):
+    wdom = _worker_safe_domain(WORKER.get("worker_domain"))
+    if not wdom or not WORKER.get("connected"):
+        await ws.close(code=1014, reason="worker not connected")
+        return
+    await _tunnel_relay(ws, uuid, wdom)
+
+
+# Reverse chain leg on Railway: user → Worker → HERE (Railway) → site.
+# The client connects to the Worker domain with /reverse/{uuid}; the Worker
+# relays the raw VLESS stream over WSS to this endpoint, which forwards it to
+# the real destination through the normal proxy_connect pipeline.
+@app.websocket("/reverse/{uuid}")
+async def reverse_ws_handler(ws: WebSocket, uuid: str):
+    await websocket_tunnel(ws, uuid)
+
+
+async def _tunnel_relay(ws: WebSocket, uuid: str, worker_domain: str):
+    """Bridge panel-WS ⇄ worker-WSS bidirectionally."""
+    import websockets as _websockets
+    await ws.accept()
+    link = None
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+    if not is_link_allowed(link):
+        await ws.close(code=1008, reason="not authorized")
+        return
+    ip = ws.headers.get("x-forwarded-for", "").split(",")[0].strip() or (ws.client.host if ws.client else "?")
+    conn_id = secrets.token_urlsafe(6)
+    connections[conn_id] = {"uuid": uuid, "ip": ip, "transport": "tunnel-ws", "connected_at": datetime.now().isoformat(), "bytes": 0}
+    log_activity("connection", f"Tunnel اتصال جدید از {ip}", "info")
+    worker_ws = None
+    try:
+        wss_url = f"wss://{worker_domain}/{uuid}"
+        headers = {"User-Agent": "Spider-Tunnel"}
+        worker_ws = await asyncio.wait_for(
+            _websockets.connect(wss_url, extra_headers=headers, max_size=None), timeout=10.0)
+
+        async def panel_to_worker():
+            while True:
+                msg = await ws.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
+                data = msg.get("bytes") or (msg.get("text") or "").encode()
+                if data:
+                    connections[conn_id]["bytes"] += len(data)
+                    stats["total_bytes"] += len(data)
+                    await worker_ws.send(data)
+
+        async def worker_to_panel():
+            async for data in worker_ws:
+                if isinstance(data, str):
+                    data = data.encode()
+                await ws.send_bytes(data)
+
+        done, pending = await asyncio.wait(
+            {asyncio.create_task(panel_to_worker()), asyncio.create_task(worker_to_panel())},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        stats["total_errors"] += 1
+        logger.warning(f"tunnel relay [{conn_id}] error: {exc}")
+    finally:
+        if worker_ws:
+            try: await worker_ws.close()
+            except Exception: pass
+        connections.pop(conn_id, None)
+
+logger.info("VLESS Relay module loaded (WS: /ws/{uuid}, tunnel: /tunnel/{uuid})")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── HTTP Proxy ────────────────────────────────────────────────────────────────
@@ -5131,7 +6011,7 @@ async def create_inbound(request: Request, auth=Depends(require_replication_auth
     _raw_ib = (body.get("name") or "").strip()[:60]
     name = _raw_ib or f"inbound-{secrets.token_hex(3)}"
     protocol = str(body.get("protocol") or "vless").lower()
-    if protocol not in ("vless", "vmess", "trojan", "reality", "telegram", "node"):
+    if protocol not in ("vless", "vmess", "trojan", "reality", "worker", "telegram", "node"):
         raise HTTPException(status_code=400, detail="Invalid protocol")
     if protocol == "node":
         selected = [str(x).strip() for x in (body.get("enabled_node_ids") or body.get("node_ids") or []) if str(x).strip()]
@@ -5154,6 +6034,18 @@ async def create_inbound(request: Request, auth=Depends(require_replication_auth
     sni = str(body.get("sni") or "").strip()
     destination = str(body.get("destination") or "").strip()
     server_name = str(body.get("server_name") or "").strip()
+    # A "worker" inbound is a special type: it is addressed to the deployed
+    # Cloudflare Worker domain; Railway only controls it and is not in the
+    # client traffic path.
+    if protocol == "worker":
+        wdom = _worker_safe_domain(WORKER.get("worker_domain"))
+        if not wdom:
+            raise HTTPException(status_code=400, detail="Worker هنوز متصل نیست — ابتدا Worker را در تب Worker متصل کنید")
+        network = "ws"
+        security = "tls"
+        domain = wdom
+        external_domain = wdom
+        sni = wdom
 
     # Telegram uses the explicit internal listener from telegram_settings.
     if protocol == "telegram":
@@ -5302,7 +6194,7 @@ async def update_inbound(inbound_id: str, request: Request, _=Depends(require_au
                 ib["name"] = _nn
         if "protocol" in body:
             p = str(body["protocol"]).lower()
-            if p in ("vless", "vmess", "trojan", "reality", "telegram", "node"): 
+            if p in ("vless", "vmess", "trojan", "reality", "worker", "telegram", "node"): 
                 ib["protocol"] = p
         if ib.get("protocol") == "node":
             if inbound_id != "Node" and not ib.get("system"):
@@ -5319,6 +6211,14 @@ async def update_inbound(inbound_id: str, request: Request, _=Depends(require_au
             await save_state()
             asyncio.create_task(refresh_node_inbound_configs(inbound_id))
             return {"ok": True, "inbound_id": inbound_id, "enabled_node_ids": list(ib.get("enabled_node_ids") or [])}
+        # A worker inbound always targets the connected worker domain; if the
+        # inbound's domain is stale/empty, refresh it automatically.
+        if ib.get("protocol") == "worker":
+            wdom = _worker_safe_domain(WORKER.get("worker_domain"))
+            if wdom:
+                ib["domain"] = wdom
+                ib["external_domain"] = wdom
+                ib["sni"] = ib.get("sni") or "www.hcaptcha.com"
         if "port" in body:
             _pv = str(body["port"] or "").strip()
             ib["port"] = int(_pv) if _pv else ""  # "" = unconfigured (reality)
@@ -5458,7 +6358,7 @@ async def update_inbound(inbound_id: str, request: Request, _=Depends(require_au
             ib.pop("sni", None)
             ib.pop("destination", None)
             ib.pop("server_name", None)
-    if (ib.get("protocol") or "").lower() not in ("telegram", "reality") and (ib.get("security") or "").lower() != "reality":
+    if (ib.get("protocol") or "").lower() not in ("telegram", "worker", "reality") and (ib.get("security") or "").lower() != "reality":
         ib["external_domain"] = ""
         ib["external_port"] = ""
 
@@ -5574,7 +6474,10 @@ async def list_users(_=Depends(require_auth)):
             "transport_type": u.get("transport_type", "ws"),
             "path": u.get("path", ""),
             "proxy_ip": u.get("proxy_ip", ""),
+            "proxy_country": "",
             "proxy_ips": u.get("proxy_ips", []),
+            "proxy_countries": [],
+            "proxy_ip_enabled": u.get("proxy_ip_enabled", False),
             "custom_ip_type": u.get("custom_ip_type", ""),
             "traffic_limit_bytes": u.get("traffic_limit_bytes", 0),
             "traffic_limit_fmt": "∞" if u.get("traffic_limit_bytes", 0) == 0 else fmt_bytes(u["traffic_limit_bytes"]),
@@ -5763,6 +6666,11 @@ async def create_user(request: Request, auth=Depends(require_replication_auth)):
         inbound_id = inbound_ids[0]
     proxy_ip = str(body.get("proxy_ip") or "").strip()
     proxy_ips = [str(x).strip() for x in (body.get("proxy_ips") or []) if str(x).strip()][:3]
+    # Cloudflare Worker routing: when enabled + worker connected, the user's
+    # configs are addressed to the worker domain with a /ws/{uuid} path.
+    proxy_ip_enabled = bool(body.get("proxy_ip_enabled"))
+    if proxy_ip_enabled and not WORKER.get("connected"):
+        proxy_ip_enabled = False
     # Scanned custom-IP source: cf | railway ("" = off). Adds up to 10 extra
     # configs in the sub, addressed by scanned IPs on non-Reality inbounds.
     custom_ip_type = str(body.get("custom_ip_type") or "").strip().lower()
@@ -5847,14 +6755,18 @@ async def create_user(request: Request, auth=Depends(require_replication_auth)):
                 raise HTTPException(status_code=409, detail="Username already exists")
 
         # Determine the path based on the inbound type, not just transport_type
-        # WS inbound -> /ws/{config_uuid}; XHTTP/Reality use their own path.
+        # WS/Worker inbound -> /ws/{config_uuid}; XHTTP/Reality use their own path.
         primary_inbound = INBOUNDS.get(inbound_id) if inbound_id else None
         primary_inbound_proto = (primary_inbound.get("protocol") if primary_inbound else "").lower()
         primary_inbound_network = (primary_inbound.get("network") if primary_inbound else "").lower()
+        worker_selected = any(((INBOUNDS.get(iid) or {}).get("protocol") or "").lower() == "worker" for iid in inbound_ids)
         relay_default_id = find_default_tls_ws_inbound_id()
         relay_enabled = bool(relay_default_id and relay_default_id in inbound_ids)
 
-        if primary_inbound_proto == "reality" and primary_inbound_network == "xhttp":
+        if primary_inbound_proto == "worker" or worker_selected:
+            # Managed Worker owns this exact route; never let a custom/legacy path diverge.
+            path = f"/ws/{config_uuid}"
+        elif primary_inbound_proto == "reality" and primary_inbound_network == "xhttp":
             # Native Xray XHTTP has one shared base path on the inbound. Xray
             # handles the per-session UUID suffix internally; never synthesize
             # /uuid here because it would diverge from xhttpSettings.path.
@@ -5890,6 +6802,7 @@ async def create_user(request: Request, auth=Depends(require_replication_auth)):
             "sni": sni,
             "proxy_ip": proxy_ip,
             "proxy_ips": proxy_ips,
+            "proxy_ip_enabled": proxy_ip_enabled,
             "custom_ip_type": custom_ip_type,
             "custom_ip_inbounds": custom_ip_inbounds,
             "sni_spoof_v2box": sni_spoof_v2box,
@@ -5922,6 +6835,8 @@ async def create_user(request: Request, auth=Depends(require_replication_auth)):
             link_protocol = "xhttp-stream-up"  # default mode
         elif transport_type == "reality":
             link_protocol = "reality"
+        elif transport_type == "worker":
+            link_protocol = "worker"
 
         if transport_type == "xhttp":
             link_xhttp = {
@@ -5946,6 +6861,12 @@ async def create_user(request: Request, auth=Depends(require_replication_auth)):
 
     asyncio.create_task(save_state())
     log_activity("user", f"کاربر «{username}» با پروتکل {protocol} ساخته شد", "ok")
+    # If the user picked the worker inbound, sync them to the worker so VLESS
+    # auth + quotas work on the Cloudflare side too.
+    if WORKER.get("connected") and inbound_ids:
+        wid = next((i for i, ib in INBOUNDS.items() if (ib.get("protocol") or "").lower() == "worker"), None)
+        if wid and wid in inbound_ids:
+            asyncio.create_task(_worker_sync_users())
     # Generate and persist telegram_secret if user has a Telegram inbound
     if inbound_ids:
         has_tg = any(
@@ -6006,6 +6927,9 @@ async def toggle_user(user_id: str, _=Depends(require_auth)):
     log_activity("user", f"کاربر «{u['username']}» {'غیرفعال' if new_status == 'disabled' else 'فعال'} شد", "ok" if new_status == "active" else "warn")
     if _selected_node_ids_for_user(u):
         asyncio.create_task(_sync_user_to_selected_nodes(user_id, dict(u)))
+    # Reflect enable/disable on the worker side too.
+    if WORKER.get("connected") and _user_uses_worker_inbound(u):
+        asyncio.create_task(_worker_sync_users())
     return {"ok": True, "user_id": user_id, "status": new_status}
 
 @app.patch("/api/users/{user_id}/reset")
@@ -6023,6 +6947,9 @@ async def reset_user_traffic(user_id: str, _=Depends(require_auth)):
     if _selected_node_ids_for_user(u):
         asyncio.create_task(_sync_user_to_selected_nodes(user_id, dict(u), force_reset=True))
     log_activity("user", f"مصرف کاربر «{username}» ریست شد", "info")
+    # Reset the worker-side usage too, so the quota reflects the reset immediately.
+    if WORKER.get("connected") and _user_uses_worker_inbound(u):
+        asyncio.create_task(_worker_sync_users())
     return {"ok": True, "user_id": user_id, "traffic_used_bytes": 0}
 
 @app.patch("/api/users/{user_id}")
@@ -6083,6 +7010,9 @@ async def edit_user(user_id: str, request: Request, _=Depends(require_auth)):
             u["fake_sni"] = str(body["fake_sni"] or "").strip()
         if "spoof_ip" in body:
             u["spoof_ip"] = str(body["spoof_ip"] or "").strip()
+        if "proxy_ip_enabled" in body:
+            en = bool(body["proxy_ip_enabled"])
+            u["proxy_ip_enabled"] = en and WORKER.get("connected")
         # proxy_country/proxy_countries removed - no longer used
         if "inbound_ids" in body:
             raw_ids = [str(x).strip() for x in (body["inbound_ids"] or []) if str(x).strip()]
@@ -6124,6 +7054,9 @@ async def edit_user(user_id: str, request: Request, _=Depends(require_auth)):
     # was removed from; otherwise the old secret remains live until reboot.
     for _tg_iid in sorted(old_telegram_inbound_ids | new_telegram_inbound_ids):
         asyncio.create_task(_restart_telegram_proxy(_tg_iid))
+    # If the user uses the worker inbound, push updated volume/expiry to the worker.
+    if WORKER.get("connected") and _user_uses_worker_inbound(u):
+        asyncio.create_task(_worker_sync_users())
     asyncio.create_task(_xray_apply())
     return {"ok": True, "user_id": user_id}
 
@@ -6234,6 +7167,8 @@ async def delete_user(user_id: str, auth=Depends(require_replication_auth)):
         asyncio.create_task(_restart_telegram_proxy(_tg_iid))
     asyncio.create_task(save_state())
     asyncio.create_task(_xray_apply())
+    if WORKER.get("connected") and _user_uses_worker_inbound(u):
+        asyncio.create_task(_worker_sync_users())
     log_activity("user", f"کاربر «{username}» حذف شد", "err")
     return {"ok": True, "deleted": target_uid, "config_uuid": config_uuid}
 
@@ -6730,7 +7665,18 @@ async def set_global_settings(request: Request, _=Depends(require_auth)):
         if "domain" in body:
             domain_val = str(body["domain"]).strip()
             if domain_val:
-                SETTINGS["domain"] = domain_val
+                # A public panel domain must be a real DNS name or globally
+                # routable IP. Do not allow localhost/internal values into state.
+                ep = _normalize_public_endpoint(domain_val)
+                if not ep:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="domain must be a public hostname or globally routable IP",
+                    )
+                # Keep the normalized endpoint cache aligned with the manual value.
+                _apply_public_endpoint(ep, "manual:settings")
+                SETTINGS["domain"] = ep["host"]
+                SETTINGS["domain_source"] = "manual"
                 # update domain history in reality too
                 reality = SETTINGS.get("reality", {})
                 history = reality.get("domain_history", [])
@@ -9463,85 +10409,354 @@ def _build_vless_connect_header(uuid: str, address: str, port: int) -> bytes:
             + bytes([port >> 8, port & 0xff]) + bytes([atype]) + ab)
 
 
-async def proxy_connect(uuid: str, address: str, port: int, proxy_override: str = None):
-    """Open an outbound TCP connection, routed through the user's proxy IP.
+RELAY_PROXY_RACE = max(
+    1, min(3, int(os.environ.get("RELAY_PROXY_RACE", "2") or "2"))
+)
+RELAY_PROXY_CONNECT_TIMEOUT = max(
+    1.5,
+    min(
+        6.0,
+        float(
+            os.environ.get("RELAY_PROXY_CONNECT_TIMEOUT", "3.25") or "3.25"
+        ),
+    ),
+)
+RELAY_DIRECT_CONNECT_TIMEOUT = max(
+    3.0,
+    min(
+        15.0,
+        float(
+            os.environ.get("RELAY_DIRECT_CONNECT_TIMEOUT", "8") or "8"
+        ),
+    ),
+)
+RELAY_PROXY_STAGGER_SECONDS = max(
+    0.0,
+    min(
+        0.5,
+        float(
+            os.environ.get("RELAY_PROXY_STAGGER_SECONDS", "0.06") or "0.06"
+        ),
+    ),
+)
 
-    Mirrors the BPB/ZEUS worker approach: for a working HTTP/SOCKS5 proxy we
-    CONNECT through it; if the picked entry is a raw relay (clean Cloudflare
-    IP), we fall back to ZEUS-style: raw-connect to proxy:port and re-send a
-    VLESS CONNECT header so the relay forwards to the target. Only when the
-    proxy fails entirely do we fall back to a direct connection.
+_RELAY_PROXY_METRICS: dict[str, dict] = {}
+_RELAY_PROXY_METRICS_LOCK = asyncio.Lock()
 
-    proxy_override: when the config path carries /proxyIP/{ip:port}/, that
-    exact proxy is used instead of a random pick from the user's list.
+
+def _relay_proxy_key(proxy: dict) -> str:
+    return "|".join(
+        str(proxy.get(k) or "")
+        for k in ("protocol", "hostname", "port", "username")
+    )
+
+
+async def _relay_record_proxy_result(
+    proxy: dict, elapsed_ms: float, ok: bool
+) -> None:
+    key = _relay_proxy_key(proxy)
+    async with _RELAY_PROXY_METRICS_LOCK:
+        metric = _RELAY_PROXY_METRICS.setdefault(
+            key,
+            {
+                "ewma_ms": 0.0,
+                "failures": 0,
+                "successes": 0,
+                "last_ok": 0.0,
+            },
+        )
+        if ok:
+            old = float(metric.get("ewma_ms") or 0.0)
+            metric["ewma_ms"] = round(
+                elapsed_ms
+                if old <= 0
+                else (old * 0.75 + elapsed_ms * 0.25),
+                2,
+            )
+            metric["failures"] = max(
+                0, int(metric.get("failures") or 0) - 1
+            )
+            metric["successes"] = int(metric.get("successes") or 0) + 1
+            metric["last_ok"] = time.time()
+        else:
+            metric["failures"] = int(metric.get("failures") or 0) + 1
+
+async def _relay_rank_proxies(proxies: list[dict]) -> list[dict]:
+    """Prefer fast/healthy routes while keeping unmeasured routes eligible."""
+    async with _RELAY_PROXY_METRICS_LOCK:
+        snapshot = {
+            k: dict(v) for k, v in _RELAY_PROXY_METRICS.items()
+        }
+
+    def score(proxy: dict) -> tuple:
+        metric = snapshot.get(_relay_proxy_key(proxy), {})
+        ewma = float(metric.get("ewma_ms") or 0.0)
+        failures = int(metric.get("failures") or 0)
+        return (
+            0 if ewma > 0 else 1,
+            ewma if ewma > 0 else 9000.0,
+            min(failures, 8) * 400.0,
+        )
+
+    return sorted(proxies, key=score)
+
+
+def _tune_relay_socket(writer: asyncio.StreamWriter) -> None:
+    """Apply conservative low-latency TCP options when supported."""
+    try:
+        transport = writer.transport
+        sock = transport.get_extra_info("socket") if transport else None
+    except Exception:
+        sock = None
+    if sock is None:
+        return
+
+    import socket as _socket
+
+    options = [
+        (_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1),
+    ]
+    if hasattr(_socket, "SO_KEEPALIVE"):
+        options.append((_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1))
+
+    for name, value in (
+        ("TCP_KEEPIDLE", 45),
+        ("TCP_KEEPINTVL", 15),
+        ("TCP_KEEPCNT", 3),
+    ):
+        opt = getattr(_socket, name, None)
+        if opt is not None:
+            options.append((_socket.IPPROTO_TCP, opt, value))
+
+    for level, opt, value in options:
+        try:
+            sock.setsockopt(level, opt, value)
+        except OSError:
+            pass
+
+
+async def _race_proxy_candidates(
+    candidates: list[dict],
+    address: str,
+    port: int,
+    uuid_value: str,
+):
+    """Race small batches of proxy paths and return the first working stream.
+
+    At most RELAY_PROXY_RACE sockets are attempted concurrently. If the batch
+    fails, the next candidates are tried. This gives fast recovery without
+    opening a large number of speculative connections per browser request.
     """
-    import random as _rnd
+    if not candidates:
+        return None
 
+    async def attempt(proxy: dict, delay: float = 0.0):
+        if delay:
+            await asyncio.sleep(delay)
+
+        started = time.perf_counter()
+
+        try:
+            got = await asyncio.wait_for(
+                _try_proxy_order(proxy, address, port),
+                timeout=RELAY_PROXY_CONNECT_TIMEOUT,
+            )
+            if got:
+                elapsed = (time.perf_counter() - started) * 1000.0
+                await _relay_record_proxy_result(proxy, elapsed, True)
+                return got, proxy, elapsed
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+        # Raw ZEUS-style VLESS relay fallback.
+        rwtr = None
+        try:
+            rrdr, rwtr = await asyncio.wait_for(
+                asyncio.open_connection(
+                    proxy["hostname"], proxy["port"]
+                ),
+                timeout=RELAY_PROXY_CONNECT_TIMEOUT,
+            )
+            _tune_relay_socket(rwtr)
+            hdr = _build_vless_connect_header(
+                uuid_value, address, port
+            )
+            rwtr.write(hdr)
+            await rwtr.drain()
+
+            elapsed = (time.perf_counter() - started) * 1000.0
+            await _relay_record_proxy_result(proxy, elapsed, True)
+            return (rrdr, rwtr), proxy, elapsed
+        except asyncio.CancelledError:
+            await _close_writer_safely(rwtr)
+            raise
+        except Exception:
+            await _close_writer_safely(rwtr)
+            elapsed = (time.perf_counter() - started) * 1000.0
+            await _relay_record_proxy_result(proxy, elapsed, False)
+            return None
+
+    for offset in range(0, len(candidates), RELAY_PROXY_RACE):
+        batch = candidates[offset:offset + RELAY_PROXY_RACE]
+        tasks = [
+            asyncio.create_task(
+                attempt(proxy, idx * RELAY_PROXY_STAGGER_SECONDS)
+            )
+            for idx, proxy in enumerate(batch)
+        ]
+
+        try:
+            for future in asyncio.as_completed(tasks):
+                try:
+                    result = await future
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    result = None
+
+                if result:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    return result
+
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    return None
+
+
+def _build_proxy_candidates(
+    entry: str, targets: list[list]
+) -> list[dict]:
+    """Preserve scheme/auth while expanding a proxy hostname to IP targets."""
+    parsed = _parse_proxy_entry(entry)
+    if not parsed:
+        return []
+
+    out = []
+    seen = set()
+    for target_host, target_port in targets:
+        proxy = {
+            **parsed,
+            "hostname": str(target_host),
+            "port": int(target_port),
+        }
+        key = _relay_proxy_key(proxy)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(proxy)
+    return out
+
+async def proxy_connect(
+    uuid: str, address: str, port: int, proxy_override: str = None
+):
+    """Open an outbound stream using the lowest-latency viable proxy path.
+
+    The relay does not split one TCP stream across several sockets. Instead it
+    races independent proxy paths for each browser-created connection. This is
+    safe for HTTP/TLS/WebSocket streams and reduces connect-time variance.
+    """
     user_id = await _resolve_user_id_for_link(uuid)
-    entry = None
+    entries: list[str] = []
+
     if proxy_override:
-        entry = proxy_override.strip()
+        entries = [proxy_override.strip()]
     elif user_id:
         async with USERS_LOCK:
-            u = USERS.get(user_id)
-            if u:
-                plist = u.get("proxy_ips") or []
-                if plist:
-                    entry = _rnd.choice(plist)
+            user = USERS.get(user_id)
+            if user:
+                entries = [
+                    str(item).strip()
+                    for item in (user.get("proxy_ips") or [])
+                    if str(item).strip()
+                ]
 
-    if entry:
-        # Expand the picked token (IP or domain) to concrete targets like the
-        # worker's 解析地址端口, then try each until one connects.
-        targets = await _resolve_proxy_targets(entry)
-        for tg in targets:
-            te = f"{tg[0]}:{tg[1]}"
-            proxy = _parse_proxy_entry(te)
-            if not proxy:
-                continue
-            got = await _try_proxy_order(proxy, address, port)
-            if got:
-                return got
-            # ZEUS-style raw relay: connect straight to proxy:port and send a
-            # reconstructed VLESS CONNECT header; the relay forwards to target.
-            rwtr = None
+    if entries:
+        candidates: list[dict] = []
+
+        for entry in entries:
             try:
-                rrdr, rwtr = await asyncio.wait_for(
-                    asyncio.open_connection(proxy["hostname"], proxy["port"]), timeout=8.0
+                targets = await _resolve_proxy_targets(entry)
+                candidates.extend(
+                    _build_proxy_candidates(entry, targets)
                 )
-                hdr = _build_vless_connect_header(uuid, address, port)
-                rwtr.write(hdr)
-                await rwtr.drain()
-                logger.info(f"proxy_connect[raw-relay] via {proxy['hostname']}:{proxy['port']} → {address}:{port}")
-                return rrdr, rwtr
             except Exception:
-                await _close_writer_safely(rwtr)
                 continue
-        logger.warning(f"proxy_connect all targets failed for {entry}")
-        return await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
 
-    return await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
+        unique: dict[str, dict] = {}
+        for candidate in candidates:
+            unique.setdefault(
+                _relay_proxy_key(candidate), candidate
+            )
 
+        ordered = await _relay_rank_proxies(
+            list(unique.values())
+        )
+        result = await _race_proxy_candidates(
+            ordered, address, port, uuid
+        )
+        if result:
+            conn, proxy, elapsed_ms = result
+            _tune_relay_socket(conn[1])
+            logger.info(
+                "proxy_connect[race] %s:%s via %s:%s %.1fms",
+                address,
+                port,
+                proxy.get("hostname"),
+                proxy.get("port"),
+                elapsed_ms,
+            )
+            return conn
+
+        logger.warning(
+            "proxy_connect pool failed for %s",
+            ",".join(entries)[:300],
+        )
+
+    # Direct fallback stays last so an unhealthy proxy never causes an
+    # accidental egress-IP leak during the racing phase.
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(address, port),
+        timeout=RELAY_DIRECT_CONNECT_TIMEOUT,
+    )
+    _tune_relay_socket(writer)
+    return reader, writer
 
 def _order_for(proto: str):
     if proto in ("socks5", "socks4"):
         return ["socks5", "http"]
     return ["http", "socks5"]
 
-
 async def _try_proxy_order(proxy, address, port):
-    for p in _order_for(proxy.get("protocol", "http")):
+    for protocol in _order_for(
+        proxy.get("protocol", "http")
+    ):
         try:
-            if p == "socks5":
-                rdr, wtr = await _socks5_connect(proxy, address, port)
+            if protocol == "socks5":
+                reader, writer = await _socks5_connect(
+                    proxy, address, port
+                )
             else:
-                rdr, wtr = await _http_connect(proxy, address, port,
-                                               tls=(proxy.get("protocol") == "https"))
-            logger.info(f"proxy_connect[{p}] via {proxy['hostname']}:{proxy['port']} → {address}:{port}")
-            return rdr, wtr
+                reader, writer = await _http_connect(
+                    proxy,
+                    address,
+                    port,
+                    tls=(proxy.get("protocol") == "https"),
+                )
+            _tune_relay_socket(writer)
+            return reader, writer
         except Exception:
             continue
     return None
-
 
 async def _link_max_ip(uuid: str) -> int:
     """Per-user concurrent_connections, falling back to global max_ip_per_user."""
@@ -9820,7 +11035,7 @@ def _add_inbound_to_xray(cfg: dict, ib: dict, iid: str, host: str):
 
     Only REALITY inbounds are served by Xray: WS/XHTTP TLS inbounds are handled
     by the FastAPI relay (Railway terminates TLS on the public port), and the
-    by the FastAPI relay (Railway terminates TLS on the public port). Adding TLS inbounds with
+    Worker inbound is handled by the Cloudflare Worker. Adding TLS inbounds with
     a fake /etc/xray/cert.pem made Xray fail on Railway (no cert file), which
     took down Reality too.
     """
@@ -9828,7 +11043,7 @@ def _add_inbound_to_xray(cfg: dict, ib: dict, iid: str, host: str):
     security = ib.get("security", "tls")
     is_reality = protocol == "reality" or security == "reality"
     if not is_reality:
-        return  # WS/XHTTP-TLS inbounds are NOT Xray's job
+        return  # WS/XHTTP-TLS + worker inbounds are NOT Xray's job
     # A reality inbound without a configured port is not ready yet — skip it
     # so Xray doesn't start on a wrong/default port.
     _raw_port = str(ib.get("port") or "").strip()
@@ -10499,6 +11714,1464 @@ async def scan_railway_ips(_=Depends(require_auth)):
 # ══════════════════════════════════════════════════════════════════════════════
 # IP SCANNER endpoints — live-saved scanned IPs + DNS resolve for the TCP tab
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+# CLOUDFLARE PAGES WORKER MANAGER — multi-location proxy via Cloudflare Pages Advanced Mode
+# Traffic: Client → Worker Domain → Cloudflare Worker → Selected Proxy IP → Internet
+# Railway only hosts the panel/API; it is NOT in the VPN data path.
+# ══════════════════════════════════════════════════════════════════════════════
+
+CF_API = "https://api.cloudflare.com/client/v4"
+CF_TOKEN_LINK = "https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_routes%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22zone%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22dns%22%2C%22type%22%3A%22edit%22%7D%5D&accountId=*&zoneId=all&name=spider-Token"
+
+# Worker script deployed to the user's Cloudflare account lives in the project
+# at worker/worker.js (source of truth; deployment uploads it as _worker.js).
+# The proxy map is stored in the worker KV control plane; adding/removing a country
+# updates the KV config and may trigger a managed worker redeploy (see /api/worker/sync).
+CF_WORKER_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "worker"
+CF_WORKER_TEMPLATE = CF_WORKER_DIR / "worker.js"
+
+
+def _worker_script() -> str:
+    """Return the worker template source, or raise if the file is missing."""
+    if not CF_WORKER_TEMPLATE.is_file():
+        raise FileNotFoundError(
+            f"worker template not found: {CF_WORKER_TEMPLATE} "
+            "(create worker/worker.js in the project repo)"
+        )
+    return CF_WORKER_TEMPLATE.read_text(encoding="utf-8")
+
+
+def _is_cf_gak(token: str) -> bool:
+    """True if token is a Cloudflare Global API Key (panel cfk_/cf_ prefix).
+
+    The full prefixed token is sent as-is to Cloudflare's X-Auth-Key header;
+    the cfk_ prefix is part of the accepted key format.
+    """
+    t = str(token or "").strip()
+    return t.startswith("cfk_") or t.startswith("cf_") or bool(re.fullmatch(r"[a-f0-9]{37}", t, re.IGNORECASE))
+
+def _cf_auth_token(token: str) -> str:
+    """Return the token value to send to Cloudflare as-is (no stripping)."""
+    return str(token or "").strip()
+
+async def _cf_api(method: str, path: str, token: str, payload: dict = None, email: str = ""):
+    """Call the Cloudflare API v4. Returns (status_code, json).
+
+    token is either a Bearer token (modern) or a Global API Key (cfk_...). When
+    the token looks like a Global API Key, we authenticate with X-Auth-Email +
+    X-Auth-Key instead of Authorization: Bearer.
+    """
+    token = str(token or "").strip()
+    email = str(email or "").strip()
+    headers = {"Content-Type": "application/json", "User-Agent": "Spider-Panel"}
+    # Cloudflare Global API Key (cfk_/cf_ prefix or 37-char hex) → Global Key
+    # auth (X-Auth-Email + X-Auth-Key). Modern Bearer tokens → Authorization.
+    # Only a real GAK is sent via X-Auth-Key; a Bearer token always uses Bearer
+    # auth even if an email happens to be on file (filling email must not turn a
+    # valid API token into a rejected X-Auth-Key).
+    _is_gak = _is_cf_gak(token)
+    if _is_gak:
+        headers["X-Auth-Key"] = token
+        headers["X-Auth-Email"] = email or os.environ.get("CF_EMAIL", "")
+    else:
+        headers["Authorization"] = f"Bearer {token}"
+    async with httpx.AsyncClient(timeout=40) as client:
+        try:
+            r = await client.request(method, f"{CF_API}{path}", headers=headers, json=payload)
+            try:
+                return r.status_code, r.json()
+            except Exception:
+                return r.status_code, {}
+        except Exception as e:
+            return 0, {"errors": [{"message": str(e)}]}
+
+
+def _worker_safe_domain(raw: str) -> str:
+    raw = str(raw or "").strip().lower()
+    raw = re.sub(r"^https?://", "", raw).rstrip("/")
+    if not raw or raw in ("localhost", "0.0.0.0", "127.0.0.1"):
+        return ""
+    return raw
+
+
+def _worker_public() -> dict:
+    """Snapshot of worker state with the API token stripped."""
+    return {
+        "connected": WORKER.get("connected", False),
+        "account_id": WORKER.get("account_id", ""),
+        "worker_name": WORKER.get("worker_name", ""),
+        "worker_domain": WORKER.get("worker_domain", ""),
+        "worker_url": WORKER.get("worker_url", ""),
+        "pages_project_name": WORKER.get("pages_project_name", ""),
+        "pages_project_id": WORKER.get("pages_project_id", ""),
+        "pages_url": WORKER.get("pages_url", ""),
+        "panel_domain": WORKER.get("panel_domain", ""),
+        "kv_namespace_id": WORKER.get("kv_namespace_id", ""),
+        "kv_namespace_title": WORKER.get("kv_namespace_title", ""),
+        "remote_status": WORKER.get("remote_status", ""),
+        "last_heartbeat": WORKER.get("last_heartbeat", ""),
+        "worker_users_online": int(WORKER.get("worker_users_online") or 0),
+        "worker_traffic_bytes": int(WORKER.get("worker_traffic_bytes") or 0),
+        "worker_user_count": int(WORKER.get("worker_user_count") or 0),
+        "last_sync": WORKER.get("last_sync", ""),
+        "last_error": WORKER.get("last_error", ""),
+        "source_url": WORKER.get("source_url", ""),
+        "auto_sync": bool(WORKER.get("auto_sync", True)),
+        "sync_error": WORKER.get("sync_error", ""),
+        "sync_count": int(WORKER.get("sync_count", 0)),
+        "routing_status": dict(WORKER.get("routing_status") or {}),
+        "token_link": CF_TOKEN_LINK,
+        "tunnel_enabled": bool(WORKER.get("tunnel_enabled", False)),
+        "tunnel_kv_namespace_id": WORKER.get("tunnel_kv_namespace_id", ""),
+        "tunnel_kv_namespace_title": WORKER.get("tunnel_kv_namespace_title", ""),
+        "reverse_kv_namespace_id": WORKER.get("reverse_kv_namespace_id", ""),
+        "reverse_kv_namespace_title": WORKER.get("reverse_kv_namespace_title", ""),
+        "proxies": [
+            {"code": code, **dict(p)}
+            for code, p in sorted((WORKER.get("proxies") or {}).items())
+        ],
+    }
+
+
+async def _ensure_worker_kv() -> str | None:
+    """Find or create the dedicated KV namespace for THIS worker ({worker}-db).
+
+    Every deployed worker gets its own private KV namespace so multiple
+    workers never share user/proxy state. The id is persisted in WORKER state;
+    on reconnect the namespace is looked up by title and reused.
+    """
+    acct = str(WORKER.get("account_id") or "")
+    cf_token = str(WORKER.get("token") or "")
+    if not acct or not cf_token:
+        return None
+    existing = str(WORKER.get("kv_namespace_id") or "")
+    if existing:
+        return existing
+    wname = str(WORKER.get("worker_name") or "").strip()
+    kv_title = f"{wname}-db" if wname else "spider-worker-kv"
+    # List existing namespaces, reuse ours if a previous deploy created it.
+    code, data = await _cf_api("GET", f"/accounts/{acct}/storage/kv/namespaces", cf_token, email="")
+    if code == 200:
+        for ns in (data.get("result") or []):
+            if ns.get("title") == kv_title:
+                async with WORKER_LOCK:
+                    WORKER["kv_namespace_id"] = ns.get("id")
+                    WORKER["kv_namespace_title"] = kv_title
+                asyncio.create_task(save_state())
+                return ns.get("id")
+    # Create a fresh dedicated namespace for this worker.
+    code, data = await _cf_api(
+        "POST", f"/accounts/{acct}/storage/kv/namespaces",
+        cf_token, {"title": kv_title}, email="",
+    )
+    if code == 200 and data.get("result"):
+        nid = data["result"].get("id")
+        async with WORKER_LOCK:
+            WORKER["kv_namespace_id"] = nid
+            WORKER["kv_namespace_title"] = kv_title
+        asyncio.create_task(save_state())
+        return nid
+    return None
+
+
+async def _ensure_tunnel_kv() -> str | None:
+    """Find or create the TUNNEL's own KV namespace ({worker}-tunnel-db).
+
+    The tunnel keeps its state separate from the main worker KV. The name is
+    derived from the worker's KV title so the pairing is always obvious.
+    """
+    acct = str(WORKER.get("account_id") or "")
+    cf_token = str(WORKER.get("token") or "")
+    if not acct or not cf_token:
+        return None
+    existing = str(WORKER.get("tunnel_kv_namespace_id") or "")
+    if existing:
+        return existing
+    wname = str(WORKER.get("worker_name") or "").strip()
+    base = f"{wname}-db" if wname else "spider-worker-kv"
+    kv_title = f"{base}-tunnel"  # e.g. spider-a1b2c3-db-tunnel
+    code, data = await _cf_api("GET", f"/accounts/{acct}/storage/kv/namespaces", cf_token, email="")
+    if code == 200:
+        for ns in (data.get("result") or []):
+            if ns.get("title") == kv_title:
+                async with WORKER_LOCK:
+                    WORKER["tunnel_kv_namespace_id"] = ns.get("id")
+                    WORKER["tunnel_kv_namespace_title"] = kv_title
+                asyncio.create_task(save_state())
+                return ns.get("id")
+    code, data = await _cf_api(
+        "POST", f"/accounts/{acct}/storage/kv/namespaces",
+        cf_token, {"title": kv_title}, email="",
+    )
+    if code == 200 and data.get("result"):
+        nid = data["result"].get("id")
+        async with WORKER_LOCK:
+            WORKER["tunnel_kv_namespace_id"] = nid
+            WORKER["tunnel_kv_namespace_title"] = kv_title
+        asyncio.create_task(save_state())
+        return nid
+    return None
+
+
+async def _ensure_reverse_kv() -> str | None:
+    """Find or create the REVERSE's own KV namespace ({worker}-db-reverse).
+
+    Reverse mode: user → Worker → Railway → site. Its state (users, usage)
+    lives in a third dedicated namespace so tunnel/reverse/worker never share
+    keys and can never interfere with each other.
+    """
+    acct = str(WORKER.get("account_id") or "")
+    cf_token = str(WORKER.get("token") or "")
+    if not acct or not cf_token:
+        return None
+    existing = str(WORKER.get("reverse_kv_namespace_id") or "")
+    if existing:
+        return existing
+    wname = str(WORKER.get("worker_name") or "").strip()
+    base = f"{wname}-db" if wname else "spider-worker-kv"
+    kv_title = f"{base}-reverse"  # e.g. spider-a1b2c3-db-reverse
+    code, data = await _cf_api("GET", f"/accounts/{acct}/storage/kv/namespaces", cf_token, email="")
+    if code == 200:
+        for ns in (data.get("result") or []):
+            if ns.get("title") == kv_title:
+                async with WORKER_LOCK:
+                    WORKER["reverse_kv_namespace_id"] = ns.get("id")
+                    WORKER["reverse_kv_namespace_title"] = kv_title
+                asyncio.create_task(save_state())
+                return ns.get("id")
+    code, data = await _cf_api(
+        "POST", f"/accounts/{acct}/storage/kv/namespaces",
+        cf_token, {"title": kv_title}, email="",
+    )
+    if code == 200 and data.get("result"):
+        nid = data["result"].get("id")
+        async with WORKER_LOCK:
+            WORKER["reverse_kv_namespace_id"] = nid
+            WORKER["reverse_kv_namespace_title"] = kv_title
+        asyncio.create_task(save_state())
+        return nid
+    return None
+
+
+async def _ensure_worker_pages_project(kv_id: str | None, tunnel_kv_id: str | None = None, reverse_kv_id: str | None = None) -> dict:
+    """Create/refresh a Cloudflare Pages project used for the managed worker.
+
+    The Pages project runs the advanced-mode `_worker.js` file generated from
+    the local `worker/worker.js` source and binds the dedicated SPIDER_KV
+    namespace (plus optional tunnel/reverse namespaces).
+    """
+    acct = str(WORKER.get("account_id") or "").strip()
+    token = str(WORKER.get("token") or "").strip()
+    name = str(WORKER.get("pages_project_name") or WORKER.get("worker_name") or "").strip().lower()
+    if not acct or not token or not name:
+        return {"ok": False, "detail": "Cloudflare account, token or Pages project name missing"}
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", name):
+        name = "spider-" + secrets.token_hex(3)
+        async with WORKER_LOCK:
+            WORKER["pages_project_name"] = name
+            WORKER["worker_name"] = name
+
+    def deployment_config():
+        kvs = {}
+        if kv_id:
+            kvs["SPIDER_KV"] = {"namespace_id": kv_id}
+        if tunnel_kv_id:
+            kvs["TUNNEL_KV"] = {"namespace_id": tunnel_kv_id}
+        if reverse_kv_id:
+            kvs["REVERSE_KV"] = {"namespace_id": reverse_kv_id}
+        return {
+            "compatibility_date": "2026-09-18",
+            "kv_namespaces": kvs,
+        }
+
+    dep_cfg = {
+        "production": deployment_config(),
+        "preview": deployment_config(),
+    }
+
+    # Reuse project if it already exists.
+    code, data = await _cf_api("GET", f"/accounts/{acct}/pages/projects/{name}", token, email="")
+    project = data.get("result") if isinstance(data, dict) else None
+    if code == 200 and project:
+        project_id = project.get("id") or ""
+        async with WORKER_LOCK:
+            WORKER["pages_project_name"] = name
+            WORKER["pages_project_id"] = project_id
+            WORKER["worker_name"] = name
+            WORKER["pages_url"] = f"https://{name}.pages.dev"
+            WORKER["worker_domain"] = f"{name}.pages.dev"
+            WORKER["worker_url"] = f"https://{name}.pages.dev"
+        # Keep production/preview bindings in sync with our dedicated KV.
+        ucode, udata = await _cf_api(
+            "PATCH",
+            f"/accounts/{acct}/pages/projects/{name}",
+            token,
+            {"production_branch": "main", "deployment_configs": dep_cfg},
+            email="",
+        )
+        if ucode not in (200, 201):
+            return {"ok": False, "detail": f"Pages binding update failed: {udata} "[:500]}
+        return {"ok": True, "project": project, "status": ucode}
+
+    # Create a new Direct Upload Pages project.
+    payload = {
+        "name": name,
+        "production_branch": "main",
+        "deployment_configs": dep_cfg,
+    }
+    ccode, cdata = await _cf_api(
+        "POST",
+        f"/accounts/{acct}/pages/projects",
+        token,
+        payload,
+        email="",
+    )
+    if ccode not in (200, 201):
+        errs = cdata.get("errors") or [] if isinstance(cdata, dict) else []
+        msg = "; ".join(str(e.get("message") or e.get("code") or "unknown") for e in errs[:3]) or str(cdata)[:400]
+        return {"ok": False, "detail": f"Pages project creation failed: {msg}"}
+    project = cdata.get("result") or {}
+    project_id = project.get("id") or ""
+    async with WORKER_LOCK:
+        WORKER["pages_project_name"] = name
+        WORKER["pages_project_id"] = project_id
+        WORKER["worker_name"] = name
+        WORKER["pages_url"] = f"https://{name}.pages.dev"
+        WORKER["worker_domain"] = f"{name}.pages.dev"
+        WORKER["worker_url"] = f"https://{name}.pages.dev"
+    asyncio.create_task(save_state())
+    return {"ok": True, "project": project, "status": ccode}
+
+
+async def _worker_deploy() -> tuple:
+    """Deploy the managed VLESS Worker as a Cloudflare Pages Advanced Mode project.
+
+    The panel creates/reuses a Pages project, configures the dedicated KV
+    binding, and uploads `worker/worker.js` as `_worker.js` using the Pages
+    Direct Upload API.
+    """
+    try:
+        template = _worker_script()
+    except Exception as e:
+        return 0, {"errors": [{"message": str(e)}]}
+
+    ctrl = str(WORKER.get("control_token") or "")
+    if not ctrl:
+        ctrl = secrets.token_urlsafe(24)
+        async with WORKER_LOCK:
+            WORKER["control_token"] = ctrl
+        asyncio.create_task(save_state())
+
+    panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
+    async with WORKER_LOCK:
+        WORKER["panel_domain"] = panel_domain
+
+    worker_domain = _worker_safe_domain(WORKER.get("worker_domain"))
+    script = (
+        template
+        .replace("__PANEL_DOMAIN__", json.dumps(panel_domain))
+        .replace("__WORKER_DOMAIN__", json.dumps(worker_domain))
+        .replace("__PANEL_TOKEN__", json.dumps(ctrl))
+    )
+
+    cf_token = str(WORKER.get("token") or "")
+    if not cf_token:
+        return 0, {"errors": [{"message": "Cloudflare API token is missing"}]}
+
+    kv_id = await _ensure_worker_kv()
+    tunnel_kv_id = await _ensure_tunnel_kv() if WORKER.get("tunnel_enabled") else None
+    reverse_kv_id = await _ensure_reverse_kv() if WORKER.get("tunnel_enabled") else None
+    pages_res = await _ensure_worker_pages_project(kv_id, tunnel_kv_id, reverse_kv_id)
+    if not pages_res.get("ok"):
+        return 0, {"errors": [{"message": pages_res.get("detail", "Pages project setup failed")}]}
+
+    # Refresh the resolved Pages domain after project creation/reuse.
+    worker_domain = _worker_safe_domain(WORKER.get("worker_domain"))
+    worker_bytes = script.encode("utf-8")
+    # Pages direct-upload manifest uses content hashes.
+    manifest = json.dumps({"_worker.js": hashlib.md5(worker_bytes).hexdigest()})
+
+    _is_gak = _is_cf_gak(cf_token)
+    if _is_gak:
+        auth_headers = {"X-Auth-Email": "", "X-Auth-Key": cf_token}
+    else:
+        auth_headers = {"Authorization": f"Bearer {cf_token}"}
+
+    project_name = str(WORKER.get("pages_project_name") or WORKER.get("worker_name") or "").strip()
+    if not project_name:
+        return 0, {"errors": [{"message": "Pages project name missing"}]}
+
+    boundary = "----SpiderPages" + secrets.token_hex(12)
+    def field(name: str, value: str) -> bytes:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n"
+        ).encode()
+
+    body = bytearray()
+    body += field("branch", "main")
+    body += field("commit_dirty", "false")
+    body += field("commit_message", "SpiderPanel managed worker deploy")
+    body += field("manifest", manifest)
+    body += (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="_worker.js"; filename="_worker.js"\r\n'
+        "Content-Type: application/javascript\r\n\r\n"
+    ).encode()
+    body += worker_bytes + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+
+    try:
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+            r = await client.post(
+                f"{CF_API}/accounts/{WORKER.get('account_id','')}/pages/projects/{project_name}/deployments",
+                headers={**auth_headers, "Content-Type": f"multipart/form-data; boundary={boundary}"},
+                content=bytes(body),
+            )
+        try:
+            deploy_json = r.json()
+        except Exception:
+            deploy_json = {}
+
+        if r.status_code not in (200, 201):
+            return r.status_code, deploy_json or {"errors": [{"message": r.text[:500]}]}
+
+        result = deploy_json.get("result") or {}
+        live_url = str(result.get("url") or "").strip()
+        aliases = result.get("aliases") or []
+        if not live_url and aliases:
+            live_url = str(aliases[0] or "").strip()
+        if live_url:
+            live_domain = _worker_safe_domain(live_url)
+            # Only use stable project.pages.dev for the VLESS address.
+            stable_domain = f"{project_name}.pages.dev"
+            async with WORKER_LOCK:
+                WORKER["pages_url"] = f"https://{stable_domain}"
+                WORKER["worker_domain"] = stable_domain
+                WORKER["worker_url"] = f"https://{stable_domain}"
+                WORKER["last_error"] = ""
+                WORKER["remote_status"] = "deployed"
+            asyncio.create_task(save_state())
+        return r.status_code, deploy_json
+    except Exception as e:
+        return 0, {"errors": [{"message": str(e)}]}
+
+
+async def _worker_enable_workers_dev() -> dict:
+    """Compatibility shim: managed deployments now use Cloudflare Pages."""
+    return {"ok": True, "detail": "Pages deployment does not require workers.dev activation"}
+
+
+async def _worker_sync_users() -> dict:
+    """Push all panel users (with volume + expiry) to the worker's KV store.
+
+    Each active panel user who picked the worker inbound is written to the
+    worker via its admin API (POST /api/users) so the VLESS worker can
+    authenticate them and enforce traffic/expiry. Returns {"ok": bool, count": N}.
+    """
+    domain = str(WORKER.get("worker_domain") or "").strip().lower()
+    ctrl = str(WORKER.get("control_token") or "")
+    if not domain or not ctrl or domain in ("localhost", "0.0.0.0", "127.0.0.1"):
+        return {"ok": False, "detail": "worker not connected / no control token"}
+    # Only users that reference the worker inbound are synced.
+    wid = None
+    for iid, ib in INBOUNDS.items():
+        if (ib.get("protocol") or "").lower() == "worker":
+            wid = iid
+            break
+    if not wid:
+        return {"ok": False, "detail": "no worker inbound"}
+    synced = 0
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        for uid, u in USERS.items():
+            iids = u.get("inbound_ids") or ([u.get("inbound_id")] if u.get("inbound_id") else [])
+            if wid not in iids:
+                continue
+            cuuid = u.get("config_uuid") or uid
+            deadline = 0
+            if u.get("expire_at"):
+                try:
+                    deadline = int(datetime.fromisoformat(u["expire_at"]).timestamp())
+                except Exception:
+                    deadline = 0
+            limit = int(u.get("traffic_limit_bytes") or 0)
+            disabled = (u.get("status") or "active") != "active"
+            try:
+                if disabled:
+                    # Disabled user → drop from the worker so it stops authenticating.
+                    r = await client.delete(
+                        f"https://{domain}/api/user/{cuuid}",
+                        headers={"Authorization": f"Bearer {ctrl}"},
+                    )
+                else:
+                    r = await client.post(
+                        f"https://{domain}/api/users",
+                        headers={"Authorization": f"Bearer {ctrl}"},
+                        json={
+                            "uuid": cuuid,
+                            "remark": u.get("username", uid),
+                            "limit_bytes": limit,
+                            "expire": deadline,
+                            "used_bytes": int(u.get("traffic_used_bytes") or 0),
+                            "proxy_ip": str(u.get("proxy_ip") or ""),
+                            "proxy_ips": [str(x).strip() for x in (u.get("proxy_ips") or []) if str(x).strip()][:6],
+                            "concurrent_connections": int(u.get("concurrent_connections") or 0),
+                            "countries": [],
+                        },
+                    )
+                if r.status_code in (200, 204):
+                    if r.status_code == 200:
+                        try:
+                            payload = r.json().get("user") or {}
+                            if payload.get("configs") is not None:
+                                u["worker_configs"] = payload.get("configs") or []
+                            if payload.get("used_bytes") is not None:
+                                u["traffic_used_bytes"] = int(payload.get("used_bytes") or 0)
+                        except Exception:
+                            pass
+                    synced += 1
+            except Exception as e:
+                logger.warning(f"worker user sync failed for {uid}: {e}")
+    return {"ok": True, "count": synced}
+
+
+async def _worker_pull_user(uid: str, u: dict) -> dict:
+    """Pull usage/expiry/country and worker-generated config metadata back from Worker."""
+    domain = str(WORKER.get("worker_domain") or "").strip().lower()
+    ctrl = str(WORKER.get("control_token") or "")
+    cuuid = u.get("config_uuid") or uid
+    if not domain or not ctrl or not cuuid:
+        return u
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            r = await client.get(f"https://{domain}/api/user/{cuuid}", headers={"Authorization": f"Bearer {ctrl}"})
+        if r.status_code != 200:
+            return u
+        data = r.json().get("user") or {}
+        if "used_bytes" in data:
+            u["traffic_used_bytes"] = int(data.get("used_bytes") or 0)
+        if data.get("expire"):
+            u["worker_expire"] = int(data.get("expire"))
+        # countries field removed - no longer used
+        if isinstance(data.get("configs"), list):
+            u["worker_configs"] = list(data.get("configs"))
+        return u
+    except Exception as e:
+        logger.warning(f"worker pull failed for {uid}: {e}")
+        return u
+
+async def _worker_pull_all_users() -> int:
+    count = 0
+    async with USERS_LOCK:
+        targets = [(uid, u) for uid, u in USERS.items() if _user_uses_worker_inbound(u)]
+    for uid, u in targets:
+        before = u.get("traffic_used_bytes")
+        out = await _worker_pull_user(uid, u)
+        if out is not u:
+            async with USERS_LOCK:
+                USERS[uid].update(out)
+        if out.get("traffic_used_bytes") != before or out.get("worker_configs") is not None:
+            count += 1
+    if count:
+        asyncio.create_task(save_state())
+    return count
+
+
+def _user_uses_worker_inbound(u: dict) -> bool:
+    """True if the user references the worker inbound (needs quota/expiry sync)."""
+    iids = u.get("inbound_ids") or ([u.get("inbound_id")] if u.get("inbound_id") else [])
+    return any((INBOUNDS.get(iid) or {}).get("protocol") == "worker" for iid in iids)
+
+
+async def _ensure_worker_inbound() -> bool:
+    """Create or refresh the default Worker inbound to match the connected
+    worker domain. Called after a worker connects/deploys so the worker inbound
+    always points address/host/sni at the current worker domain."""
+    wdom = _worker_safe_domain(WORKER.get("worker_domain"))
+    if not wdom:
+        return False
+    changed = False
+    async with INBOUNDS_LOCK:
+        wid = next((i for i, ib in INBOUNDS.items() if (ib.get("protocol") or "").lower() == "worker"), None)
+        if wid:
+            ib = INBOUNDS[wid]
+            if (ib.get("domain") or "") != wdom or (ib.get("external_domain") or "") != wdom:
+                ib["domain"] = wdom
+                ib["external_domain"] = wdom
+                changed = True
+        else:
+            INBOUNDS["default-worker"] = {
+                "name": "Worker (Multi-Location)",
+                "protocol": "worker",
+                "port": 443,
+                "network": "ws",
+                "security": "tls",
+                "domain": wdom,
+                "external_domain": wdom,
+                "sni": "www.hcaptcha.com",
+                "spoof_ip": "8.6.112.4",
+                "external_port": 443,
+                "fingerprint": "chrome",
+                "reality_settings": {},
+                "xhttp_settings": {},
+                "ws_settings": {"path": "/ws/{uuid}"},
+                "grpc_settings": {},
+                "created_at": datetime.now().isoformat(),
+            }
+            changed = True
+    if changed:
+        asyncio.create_task(save_state())
+    return True
+
+
+def _worker_transient_network_error(detail: str) -> bool:
+    """Return True for deployment-time DNS/connection errors that may clear after Pages propagates."""
+    msg = str(detail or '').lower()
+    transient_tokens = (
+        'name or service not known',
+        'temporary failure in name resolution',
+        'temporary failure',
+        'nodename nor servname provided',
+        'getaddrinfo failed',
+        'network is unreachable',
+        'connection refused',
+        'connect timeout',
+        'timed out',
+        '502', '503', '504',
+    )
+    return any(tok in msg for tok in transient_tokens)
+
+
+async def _worker_retry_after_deploy() -> None:
+    """Retry remote control after a fresh Pages deploy while DNS/route propagation settles."""
+    delays = (5, 10, 20, 30, 45)
+    for delay in delays:
+        await asyncio.sleep(delay)
+        try:
+            if not WORKER.get('connected'):
+                return
+            res = await _worker_push_config()
+            if res.get('ok'):
+                await _worker_pull_all_users()
+                await _worker_pull_status()
+                return
+        except Exception:
+            pass
+
+
+async def _worker_push_config() -> dict:
+    """Remote control: push the full panel config to the worker in one call.
+
+    POST /panel/config (Bearer control token) carries users (uuid, limit,
+    expire, used, countries), the proxy routes and settings. The worker stores
+    everything in its dedicated KV and answers with a summary. This is the
+    single "panel → worker" channel; individual /api/users calls stay for
+    incremental updates.
+    """
+    domain = str(WORKER.get("worker_domain") or "").strip().lower()
+    ctrl = str(WORKER.get("control_token") or "")
+    if not domain or not ctrl or domain in ("localhost", "0.0.0.0", "127.0.0.1"):
+        return {"ok": False, "detail": "worker not connected / no control token"}
+    wid = next((iid for iid, ib in INBOUNDS.items()
+                if ((ib or {}).get("protocol") or "").lower() == "worker"), None)
+    if not wid:
+        return {"ok": False, "detail": "no worker inbound"}
+    users = []
+    async with USERS_LOCK:
+        for uid, u in USERS.items():
+            iids = u.get("inbound_ids") or ([u.get("inbound_id")] if u.get("inbound_id") else [])
+            if wid and wid not in iids:
+                continue
+            cuuid = u.get("config_uuid") or uid
+            deadline = 0
+            if u.get("expire_at"):
+                try:
+                    deadline = int(datetime.fromisoformat(u["expire_at"]).timestamp())
+                except Exception:
+                    deadline = 0
+            users.append({
+                "uuid": cuuid,
+                "remark": u.get("username", uid),
+                "limit_bytes": int(u.get("traffic_limit_bytes") or 0),
+                "expire": deadline,
+                "used_bytes": int(u.get("traffic_used_bytes") or 0),
+                "concurrent_connections": int(u.get("concurrent_connections") or 0),
+                "proxy_ip": str(u.get("proxy_ip") or ""),
+                "proxy_ips": [str(x).strip() for x in (u.get("proxy_ips") or []) if str(x).strip()][:6],
+                "countries": [],
+                "disabled": (u.get("status") or "active") != "active",
+            })
+    try:
+        last_detail = ''
+        # A new Pages project can be deployed before its *.pages.dev hostname
+        # becomes resolvable. Retry briefly instead of failing worker creation.
+        for attempt, delay in enumerate((0, 2, 4, 8), 1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                    r = await client.post(
+                        f"https://{domain}/panel/config",
+                        headers={"Authorization": f"Bearer {ctrl}"},
+                        json={
+                            "users": users,
+                            "routes": {},
+                            "proxies": dict(WORKER.get("proxies") or {}),
+                            "settings": {
+                                "adaptive_routing": True,
+                                "proxy_race": 2,
+                                "health_check_interval_ms": 30000,
+                            },
+                        },
+                    )
+                if r.status_code == 200:
+                    break
+                last_detail = f"worker returned HTTP {r.status_code}: {r.text[:120]}"
+                if r.status_code not in (502, 503, 504):
+                    return {"ok": False, "detail": last_detail}
+            except Exception as exc:
+                last_detail = str(exc)
+                if not _worker_transient_network_error(last_detail) or attempt == 4:
+                    return {"ok": False, "detail": last_detail}
+        if r.status_code == 200:
+            data = {}
+            try:
+                data = r.json()
+            except Exception:
+                pass
+            async with WORKER_LOCK:
+                WORKER["remote_status"] = "online"
+                WORKER["last_heartbeat"] = now_ir().isoformat(timespec="seconds")
+                WORKER["worker_user_count"] = int(data.get("users") or len(users))
+                WORKER["worker_traffic_bytes"] = int(data.get("traffic") or 0)
+                WORKER["worker_users_online"] = int(data.get("online") or 0)
+            asyncio.create_task(save_state())
+            return {"ok": True, "detail": "config pushed", "users": data.get("users", len(users))}
+        return {"ok": False, "detail": last_detail or f"worker returned HTTP {r.status_code}: {r.text[:120]}"}
+    except Exception as e:
+        return {"ok": False, "detail": str(e)}
+
+async def _worker_pull_status() -> dict:
+    """Pull live status from the worker's GET /panel/status API.
+
+    Returns {ok, online, traffic, users} and records a heartbeat timestamp so
+    the UI can show how fresh the remote state is.
+    """
+    domain = str(WORKER.get("worker_domain") or "").strip().lower()
+    ctrl = str(WORKER.get("control_token") or "")
+    if not domain or not ctrl or domain in ("localhost", "0.0.0.0", "127.0.0.1"):
+        return {"ok": False, "detail": "worker not connected"}
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.get(f"https://{domain}/panel/status",
+                                 headers={"Authorization": f"Bearer {ctrl}"})
+        if r.status_code != 200:
+            async with WORKER_LOCK:
+                WORKER["remote_status"] = "unreachable"
+            return {"ok": False, "detail": f"HTTP {r.status_code}"}
+        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        hb = now_ir().isoformat(timespec="seconds")
+        async with WORKER_LOCK:
+            WORKER["remote_status"] = "online"
+            WORKER["last_heartbeat"] = hb
+            WORKER["worker_user_count"] = int(data.get("users") or 0)
+            WORKER["worker_traffic_bytes"] = int(data.get("traffic") or 0)
+            WORKER["worker_users_online"] = int(data.get("online") or 0)
+            if isinstance(data.get("routing"), dict):
+                WORKER["routing_status"] = dict(data.get("routing") or {})
+        asyncio.create_task(save_state())
+        return {"ok": True, **data}
+    except Exception as e:
+        async with WORKER_LOCK:
+            WORKER["remote_status"] = "unreachable"
+        return {"ok": False, "detail": str(e)}
+
+async def _worker_control_update() -> dict:
+    """Keep worker KV synchronized (no multi-location anymore)."""
+    domain = str(WORKER.get("worker_domain") or "").strip().lower()
+    ctrl = str(WORKER.get("control_token") or "")
+    if not domain or not ctrl or domain in ("localhost", "0.0.0.0", "127.0.0.1"):
+        return {"ok": False, "detail": "worker not connected / no control token"}
+    # Single-location worker - no routes to sync
+    try:
+        # Single-location worker - nothing to sync
+        return {"ok": True, "detail": "no multi-location to sync"}
+    except Exception as e:
+        return {"ok": False, "detail": str(e)}
+
+
+# ── Daily proxy source sync ──────────────────────────────────────────────────
+# Source file format (ProxyIP-Daily.md by NiREvil):
+#   ## 🇩🇪 Germany (517 proxies)      ← flag emoji encodes the ISO code
+#   <details><summary>...</summary>
+#   | IP | ISP | Location | Risk Score |
+#   | <pre><code>94.141.123.243</code></pre> | ISP | Hesse, Frankfurt | badge |
+# ISP-grouped sections (Google/Amazon/…) have no flag → skipped.
+_FLAG_RE = re.compile(r"^##\s*([\U0001F1E6-\U0001F1FF]{2})\s*([^\s(][^()]*?)\s*\(\d+\s*proxies\)")
+_IPCELL_RE = re.compile(r"<pre><code>\s*((?:\d{1,3}\.){3}\d{1,3}|[a-z0-9.-]+\.[a-z]{2,})\s*</code></pre>", re.I)
+# A few sections show only a bare code (e.g. "AD") instead of a full name.
+_CODE_NAME = {
+    "AD": "Andorra", "BA": "Bosnia & Herzegovina", "BD": "Bangladesh",
+    "DO": "Dominican Republic", "IS": "Iceland", "KG": "Kyrgyzstan", "SY": "Syria",
+}
+
+
+def _flag_to_code(flag: str) -> str:
+    """Decode a flag emoji (regional indicators) into an ISO 3166-1 alpha-2 code."""
+    cps = [ord(c) for c in flag]
+    if len(cps) < 2 or not all(0x1F1E6 <= c <= 0x1F1FF for c in cps):
+        return ""
+    return "".join(chr(0x41 + (c - 0x1F1E6)) for c in cps)
+
+
+def _code_to_flag(code: str) -> str:
+    """Encode an ISO 3166-1 alpha-2 code into a flag emoji."""
+    code = str(code or "").strip().upper()
+    if len(code) != 2 or not code.isalpha():
+        return ""
+    return chr(0x1F1E6 + (ord(code[0]) - ord('A'))) + chr(0x1F1E6 + (ord(code[1]) - ord('A')))
+
+
+def _parse_proxy_daily(text: str, limit_per_country: int = 3) -> dict:
+    """Parse the daily markdown into {code: {country, proxy, port}}.
+
+    For each country section the first `limit_per_country` IP cells are kept
+    (rows are sorted best-first by risk score). Only sections with a flag emoji
+    are used; ISP-grouped sections are skipped.
+    """
+    out: dict = {}
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+    while i < n:
+        m = _FLAG_RE.match(lines[i].strip())
+        if not m:
+            i += 1
+            continue
+        code = _flag_to_code(m.group(1)).lower()
+        name = (m.group(2) or "").strip()
+        if not code:
+            i += 1
+            continue
+        if len(name) == 2 and name.isupper():
+            name = _CODE_NAME.get(name.upper(), name)
+        # Collect IP cells until the next '## ' section header.
+        picked: list[str] = []
+        j = i + 1
+        while j < n:
+            line = lines[j].strip()
+            if line.startswith("## ") or line.startswith("---"):
+                break
+            if line.startswith("|") and "<pre><code>" in line:
+                cell = _IPCELL_RE.search(line)
+                if cell and cell.group(1) not in picked:
+                    picked.append(cell.group(1))
+                    if len(picked) >= limit_per_country:
+                        break
+            j += 1
+        if picked:
+            out[code] = {
+                "country": name or code.upper(),
+                "country_code": code.upper(),
+                "proxy": picked[0],
+                "port": 443,
+                "proxies": picked,
+            }
+        i = j
+    return out
+
+
+async def _fetch_proxy_daily(url: str) -> str:
+    """Fetch the daily proxy markdown, preferring the raw GitHub URL."""
+    url = str(url or "").strip()
+    if not url:
+        raise ValueError("منبع پروکسی تنظیم نشده است")
+    # GitHub blob page → raw URL so we get the file, not HTML.
+    m = re.match(r"^https://github\.com/([^/]+)/([^/]+)/blob/(.+)$", url)
+    if m:
+        url = f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}/{m.group(3)}"
+    async with httpx.AsyncClient(timeout=40, follow_redirects=True) as client:
+        r = await client.get(url)
+    if r.status_code != 200:
+        raise ValueError(f"دریافت منبع ناموفق بود (HTTP {r.status_code})")
+    return r.text
+
+
+async def _sync_worker_proxies_from_source() -> dict:
+    """Fetch + parse the daily proxy source and push it to the deployed worker.
+
+    Returns a summary dict. Under WORKER_SYNC_LOCK so the hourly loop and the
+    manual button never run concurrently.
+    """
+    async with WORKER_SYNC_LOCK:
+        source_url = WORKER.get("source_url", "")
+        try:
+            text = await _fetch_proxy_daily(source_url)
+            parsed = _parse_proxy_daily(text)
+            if not parsed:
+                raise ValueError("در منبع، کشوری پیدا نشد (قالب تغییر کرده؟)")
+            async with WORKER_LOCK:
+                # Merge: entries manually added/edited in the panel (manual=True)
+                # survive the source refresh, so admin edits are never wiped out.
+                manual = {
+                    code: p for code, p in (WORKER.get("proxies") or {}).items()
+                    if p.get("manual")
+                }
+                parsed.update(manual)
+                WORKER["proxies"] = parsed
+                WORKER["sync_count"] = int(WORKER.get("sync_count", 0)) + 1
+            deploy_ok = True
+            if WORKER.get("connected"):
+                sc, sd = await _worker_deploy()
+                deploy_ok = sc in (200, 201, 409)
+                if not deploy_ok:
+                    raise ValueError((sd.get("errors") or [{}])[0].get("message", "deploy failed"))
+                # After deploy, immediately push the fresh proxy map + users
+                # into the Worker KV. The deployed script itself is provider
+                # neutral; runtime routing state lives in the dedicated KV.
+                push = await _worker_push_config()
+                if not push.get("ok"):
+                    logger.warning("worker runtime config push after source sync failed: %s", push.get("detail"))
+            # Keep the default Worker inbound pointed at the worker domain.
+            await _ensure_worker_inbound()
+            async with WORKER_LOCK:
+                WORKER["last_sync"] = now_ir().isoformat(timespec="seconds")
+                WORKER["sync_error"] = ""
+                WORKER["last_error"] = ""
+            asyncio.create_task(save_state())
+            log_activity("worker", f"پروکسی‌های Worker از منبع بروزرسانی شد ({len(parsed)} کشور)", "ok")
+            return {
+                "ok": True,
+                "countries": len(parsed),
+                "count": sum(len(v.get("proxies") or [v.get("proxy")]) for v in parsed.values()),
+                "deployed": deploy_ok,
+            }
+        except Exception as e:
+            msg = str(e)
+            async with WORKER_LOCK:
+                WORKER["sync_error"] = msg
+                WORKER["last_error"] = msg
+            asyncio.create_task(save_state())
+            logger.warning(f"worker proxy sync failed: {msg}")
+            return {"ok": False, "error": msg}
+
+
+@app.get("/api/worker")
+async def worker_get(_=Depends(require_auth)):
+    """Worker status + proxy map (token is never exposed)."""
+    async with WORKER_LOCK:
+        return {"ok": True, **_worker_public()}
+
+
+@app.post("/api/worker/setup")
+async def worker_setup(request: Request, _=Depends(require_auth)):
+    """Create/reuse a Cloudflare Pages project and deploy the managed worker source as `_worker.js`.
+
+    The supplied Cloudflare API token is validated first. A dedicated KV
+    namespace is created/attached, then the project is deployed in Pages
+    Advanced Mode with `_worker.js` and the SPIDER_KV binding.
+    """
+    body = await request.json()
+    token = str(body.get("token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required")
+
+    account_id = ""
+    email = ""
+
+    # Verify token.
+    _is_gak = _is_cf_gak(token)
+    verify_path = "/user/tokens/verify" if not _is_gak else "/user"
+    code, data = await _cf_api("GET", verify_path, token, email=email)
+    if code != 200 or not data.get("success"):
+        msg = (data.get("errors") or [{}])[0].get("message", "invalid token")
+        raise HTTPException(status_code=400, detail=f"Cloudflare token rejected: {msg}")
+
+    # Auto-detect account.
+    code_acc, data_acc = await _cf_api(
+        "GET",
+        "/accounts?page=1&per_page=50",
+        token,
+        email=email,
+    )
+    if code_acc == 200 and data_acc.get("result"):
+        accounts = data_acc["result"]
+        if isinstance(accounts, list) and accounts:
+            account_id = str(accounts[0].get("id") or "")
+
+    if not account_id:
+        errs = data_acc.get("errors") or []
+        detail = "Could not auto-detect Cloudflare Account ID. The token needs account access plus Pages Write and Workers KV Storage Edit."
+        if errs:
+            detail = "Cloudflare account lookup failed: " + "; ".join(
+                str(e.get("message") or e.get("code") or "unknown error")
+                for e in errs[:3]
+            )
+        raise HTTPException(status_code=400, detail=detail)
+
+    worker_name = str(body.get("worker_name") or "").strip().lower()
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", worker_name or ""):
+        worker_name = "spider-" + secrets.token_hex(3)
+
+    stable_domain = f"{worker_name}.pages.dev"
+
+    async with WORKER_LOCK:
+        WORKER.update({
+            "connected": True,
+            "account_id": account_id,
+            "worker_name": worker_name,
+            "worker_domain": stable_domain,
+            "worker_url": f"https://{stable_domain}",
+            "pages_project_name": worker_name,
+            "pages_project_id": "",
+            "pages_url": f"https://{stable_domain}",
+            "token": token,
+            "kv_namespace_id": "",
+            "kv_namespace_title": "",
+            "remote_status": "",
+            "last_heartbeat": "",
+            "worker_users_online": 0,
+            "worker_traffic_bytes": 0,
+            "worker_user_count": 0,
+            "last_error": "",
+        })
+
+    kv_id = await _ensure_worker_kv()
+    if not kv_id:
+        async with WORKER_LOCK:
+            WORKER["last_error"] = "Could not create/find dedicated Worker KV namespace"
+        asyncio.create_task(save_state())
+        raise HTTPException(status_code=500, detail="Could not create/find dedicated Worker KV namespace")
+
+    sc, sd = await _worker_deploy()
+    if sc not in (200, 201, 409):
+        msg = (sd.get("errors") or [{}])[0].get("message", "Pages deploy failed")
+        async with WORKER_LOCK:
+            WORKER["last_error"] = msg
+        asyncio.create_task(save_state())
+        raise HTTPException(status_code=500, detail=f"Worker Pages deploy failed: {msg}")
+
+    await _ensure_worker_inbound()
+    ctrl_res = await _worker_push_config()
+    deferred_sync = False
+    deferred_reason = ""
+    if not ctrl_res.get("ok"):
+        detail = ctrl_res.get("detail", "worker config push failed")
+        if _worker_transient_network_error(detail):
+            # Pages deployments can need a short DNS propagation window. The
+            # worker is already deployed, so do not report creation as failed.
+            deferred_sync = True
+            deferred_reason = detail
+            async with WORKER_LOCK:
+                WORKER["last_error"] = ""
+                WORKER["remote_status"] = "pending"
+            asyncio.create_task(_worker_retry_after_deploy())
+        else:
+            async with WORKER_LOCK:
+                WORKER["last_error"] = detail
+            asyncio.create_task(save_state())
+            raise HTTPException(status_code=502, detail=f"Worker control sync failed: {detail}")
+
+    if not deferred_sync:
+        await _worker_pull_all_users()
+
+    async with WORKER_LOCK:
+        WORKER["last_sync"] = now_ir().isoformat(timespec="seconds")
+        WORKER["last_error"] = ""
+        WORKER["remote_status"] = "pending" if deferred_sync else "deployed"
+
+    asyncio.create_task(save_state())
+    log_activity(
+        "worker",
+        f"Cloudflare Pages Worker ساخته و Deploy شد ({worker_name} / KV: {WORKER.get('kv_namespace_title') or kv_id})",
+        "ok",
+    )
+    async with WORKER_LOCK:
+        out = {"ok": True, **_worker_public()}
+    if deferred_sync:
+        out["deferred_sync"] = True
+        out["deferred_reason"] = deferred_reason
+    return out
+
+
+@app.post("/api/worker/sync")
+async def worker_sync(_=Depends(require_auth)):
+    """Re-deploy the managed Pages Worker after proxy changes and re-push users/quotas."""
+    if not WORKER.get("connected"):
+        raise HTTPException(status_code=400, detail="worker is not connected")
+    sc, sd = await _worker_deploy()
+    if sc in (200, 201, 409):
+        await _ensure_worker_inbound()
+        push = await _worker_push_config()
+        if not push.get("ok"):
+            await _worker_sync_users()
+        await _worker_pull_all_users()
+    async with WORKER_LOCK:
+        if sc in (200, 201, 409):
+            WORKER["last_sync"] = now_ir().isoformat(timespec="seconds")
+            WORKER["last_error"] = ""
+            out = {"ok": True, **_worker_public()}
+        else:
+            msg = (sd.get("errors") or [{}])[0].get("message", "deploy failed")
+            WORKER["last_error"] = msg
+            out = {"ok": False, "error": msg, **_worker_public()}
+    asyncio.create_task(save_state())
+    return out
+
+
+@app.post("/api/worker/sync-source")
+async def worker_sync_source(_=Depends(require_auth)):
+    """Fetch the daily proxy source now, update the pool and re-deploy."""
+    res = await _sync_worker_proxies_from_source()
+    if not res.get("ok"):
+        return JSONResponse(status_code=400, content={"ok": False, "error": res.get("error")})
+    async with WORKER_LOCK:
+        return {"ok": True, **_worker_public(), "sync": res}
+
+
+@app.post("/api/worker/settings")
+async def worker_settings(request: Request, _=Depends(require_auth)):
+    """Update worker source URL / auto-sync preference."""
+    body = await request.json()
+    async with WORKER_LOCK:
+        if "source_url" in body:
+            src = str(body["source_url"] or "").strip()
+            if src:
+                WORKER["source_url"] = src
+        if "auto_sync" in body:
+            WORKER["auto_sync"] = bool(body["auto_sync"])
+        out = {"ok": True, **_worker_public()}
+    asyncio.create_task(save_state())
+    return out
+
+
+@app.post("/api/worker/health-check")
+async def worker_health_check(_=Depends(require_auth)):
+    """Force an active Cloudflare Worker downstream route health check."""
+    if not WORKER.get("connected"):
+        raise HTTPException(status_code=400, detail="worker is not connected")
+    domain = _worker_safe_domain(WORKER.get("worker_domain"))
+    ctrl = str(WORKER.get("control_token") or "")
+    if not domain or not ctrl:
+        raise HTTPException(status_code=400, detail="worker control plane is unavailable")
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            r = await client.post(f"https://{domain}/panel/health-check", headers={"Authorization": f"Bearer {ctrl}"})
+        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        if r.status_code != 200:
+            return JSONResponse(status_code=502, content={"ok": False, "detail": data.get("error") or f"HTTP {r.status_code}"})
+        async with WORKER_LOCK:
+            WORKER["routing_status"] = dict(data.get("routing") or {})
+            WORKER["last_heartbeat"] = now_ir().isoformat(timespec="seconds")
+            WORKER["remote_status"] = "online"
+        asyncio.create_task(save_state())
+        return {"ok": True, "routing": data.get("routing") or {}, **_worker_public()}
+    except Exception as e:
+        async with WORKER_LOCK:
+            WORKER["remote_status"] = "unreachable"
+            WORKER["last_error"] = str(e)
+        asyncio.create_task(save_state())
+        return JSONResponse(status_code=502, content={"ok": False, "detail": str(e), **_worker_public()})
+
+
+@app.post("/api/worker/heartbeat")
+async def worker_heartbeat(_=Depends(require_auth)):
+    """Ping the worker's /panel/status and refresh remote counters (traffic,
+    online users, user count). Called by the UI on a timer."""
+    if not WORKER.get("connected"):
+        raise HTTPException(status_code=400, detail="worker is not connected")
+    res = await _worker_pull_status()
+    async with WORKER_LOCK:
+        out = {"ok": bool(res.get("ok")), "detail": res.get("detail", ""), **_worker_public()}
+    return out
+
+@app.delete("/api/worker")
+async def worker_disconnect(_=Depends(require_auth)):
+    """Remove the worker connection (keeps nothing sensitive)."""
+    async with WORKER_LOCK:
+        WORKER.clear()
+        WORKER.update({
+            "connected": False,
+            "account_id": "",
+            "worker_name": "",
+            "worker_domain": "",
+            "worker_url": "",
+            "pages_project_name": "",
+            "pages_project_id": "",
+            "pages_url": "",
+            "token": "",
+            "kv_namespace_id": "",
+            "kv_namespace_title": "",
+            "remote_status": "",
+            "last_heartbeat": "",
+            "worker_users_online": 0,
+            "worker_traffic_bytes": 0,
+            "worker_user_count": 0,
+            "proxies": {},
+            "last_sync": "",
+            "last_error": "",
+            "source_url": "https://raw.githubusercontent.com/NiREvil/vless/main/sub/ProxyIP-Daily.md",
+            "auto_sync": True,
+            "sync_error": "",
+            "sync_count": 0,
+            "routing_status": {},
+        })
+    asyncio.create_task(save_state())
+    log_activity("worker", "Worker قطع شد", "warn")
+    return {"ok": True}
+
+
+@app.post("/api/worker/proxies")
+async def worker_add_proxy(request: Request, _=Depends(require_auth)):
+    """Add or update a proxy country entry, then re-deploy the worker."""
+    body = await request.json()
+    code = str(body.get("code") or "").strip().lower()
+    country = str(body.get("country") or "").strip()
+    proxy = str(body.get("proxy") or "").strip()
+    port = int(body.get("port") or 443)
+    continent = str(body.get("continent") or "").strip().upper()[:2]
+    colo = str(body.get("colo") or "").strip().upper()[:8]
+    region = str(body.get("region") or "").strip()[:80]
+    try:
+        latitude = float(body.get("latitude")) if body.get("latitude") not in (None, "") else 0.0
+        longitude = float(body.get("longitude")) if body.get("longitude") not in (None, "") else 0.0
+    except Exception:
+        latitude, longitude = 0.0, 0.0
+    if not code or not country or not proxy:
+        raise HTTPException(status_code=400, detail="code, country and proxy are required")
+    if not re.fullmatch(r"[a-z0-9_-]{1,16}", code):
+        raise HTTPException(status_code=400, detail="invalid country code (a-z0-9_-)")
+    async with WORKER_LOCK:
+        (WORKER.setdefault("proxies", {}))[code] = {
+            "country": country,
+            "country_code": code.upper(),
+            "proxy": proxy,
+            "port": max(1, min(65535, port)),
+            "continent": continent,
+            "colo": colo,
+            "region": region,
+            "latitude": latitude if -90 <= latitude <= 90 else 0.0,
+            "longitude": longitude if -180 <= longitude <= 180 else 0.0,
+            "manual": True,
+        }
+    if WORKER.get("connected"):
+        await worker_sync(None)
+    else:
+        asyncio.create_task(save_state())
+    async with WORKER_LOCK:
+        return {"ok": True, **_worker_public()}
+
+
+@app.delete("/api/worker/proxies/{code}")
+async def worker_del_proxy(code: str, _=Depends(require_auth)):
+    """Remove a proxy country entry and re-deploy."""
+    async with WORKER_LOCK:
+        (WORKER.get("proxies") or {}).pop(code.lower(), None)
+    if WORKER.get("connected"):
+        await worker_sync(None)
+    else:
+        asyncio.create_task(save_state())
+    async with WORKER_LOCK:
+        return {"ok": True, **_worker_public()}
+
+
+@app.get("/api/worker/locations")
+async def worker_locations(_=Depends(require_auth)):
+    """Location status list for the Map tab. Prefers live data from the worker."""
+    async with WORKER_LOCK:
+        if WORKER.get("connected") and WORKER.get("worker_url"):
+            try:
+                async with httpx.AsyncClient(timeout=12) as client:
+                    r = await client.get(f"{WORKER['worker_url']}/api/locations")
+                if r.status_code == 200:
+                    return {"ok": True, "locations": r.json()}
+            except Exception:
+                pass
+            return {"ok": True, "locations": [
+                {"country": p.get("country"), "code": c, "proxy": p.get("proxy"),
+                 "port": p.get("port", 443), "status": "online", "ping": 0}
+                for c, p in (WORKER.get("proxies") or {}).items()
+            ]}
+    return {"ok": True, "locations": []}
+
+
+@app.get("/api/worker/inbounds")
+async def worker_inbounds(_=Depends(require_auth)):
+    """Return worker inbounds with their country options for user creation modal."""
+    async with INBOUNDS_LOCK:
+        worker_inbounds = []
+        for iid, ib in INBOUNDS.items():
+            if (ib.get("protocol") or "").lower() == "worker":
+                worker_inbounds.append({
+                    "inbound_id": iid,
+                    "name": ib.get("name", "Worker"),
+                    "domain": ib.get("domain", ""),
+                    "countries": [
+                        {"code": c, "country": p.get("country", c.upper())}
+                        for c, p in (WORKER.get("proxies") or {}).items()
+                    ]
+                })
+    return {"ok": True, "inbounds": worker_inbounds}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TUNNEL — user → Railway → Cloudflare Worker → site
+# The tunnel inbound is a TLS+WS inbound on the RAILWAY domain with path
+# /tunnel/{uuid}. Railway forwards to the Worker; the Worker connects out to
+# the destination. The tunnel has its own dedicated KV namespace (TUNNEL_KV).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _tunnel_log(msg: str):
+    WORKER.setdefault("tunnel_logs", []).append(
+        {"msg": str(msg)[:250], "time": now_ir().isoformat(timespec="seconds")})
+    if len(WORKER["tunnel_logs"]) > 100:
+        del WORKER["tunnel_logs"][:-100]
+
+
+@app.post("/api/tunnel/create")
+async def tunnel_create(_=Depends(require_auth)):
+    """Create the Tunnel inbound + its dedicated KV namespace.
+
+    Steps:
+      1. ensure the TUNNEL_KV namespace exists ({worker}-db-tunnel),
+      2. mark tunnel_enabled → next deploy binds TUNNEL_KV and re-deploys,
+      3. create/refresh the 'default-tunnel' inbound: TLS + WS on the Railway
+         panel domain with ws path /tunnel/{uuid}.
+    """
+    if not WORKER.get("connected"):
+        raise HTTPException(status_code=400, detail="worker is not connected")
+    kv_id = await _ensure_tunnel_kv()
+    if not kv_id:
+        raise HTTPException(status_code=500, detail="could not create tunnel KV namespace")
+    async with WORKER_LOCK:
+        WORKER["tunnel_enabled"] = True
+        if not WORKER.get("tunnel_created_at"):
+            WORKER["tunnel_created_at"] = now_ir().isoformat(timespec="seconds")
+        _tunnel_log(f"Tunnel KV ساخته شد: {WORKER.get('tunnel_kv_namespace_title')}")
+    # Re-deploy so the TUNNEL_KV binding goes live.
+    sc, sd = await _worker_deploy()
+    ok_deploy = sc in (200, 201, 409)
+    async with WORKER_LOCK:
+        _tunnel_log("Worker با binding جدید deploy شد" if ok_deploy else f"deploy ناموفق: {sc}")
+    panel_domain = _safe_host(SETTINGS.get("domain"), get_host())
+    async with INBOUNDS_LOCK:
+        INBOUNDS["default-tunnel"] = {
+            "name": "Tunnel (Railway → CF Worker)",
+            "protocol": "tunnel",
+            "port": 443,
+            "network": "ws",
+            "security": "tls",
+            "domain": panel_domain,
+            "external_domain": panel_domain,
+            "sni": "",
+            "spoof_ip": "",
+            "external_port": 443,
+            "fingerprint": "chrome",
+            "reality_settings": {},
+            "xhttp_settings": {},
+            "ws_settings": {"path": "/tunnel/{uuid}"},
+            "grpc_settings": {},
+            "worker_domain": str(WORKER.get("worker_domain") or ""),
+            "created_at": datetime.now().isoformat(),
+        }
+        changed = True
+    asyncio.create_task(save_state())
+    async with WORKER_LOCK:
+        _tunnel_log(f"اینباند Tunnel روی {panel_domain} با مسیر /tunnel/{{uuid}} ساخته شد")
+    log_activity("tunnel", "اینباند Tunnel ایجاد شد", "ok")
+    asyncio.create_task(save_state())
+    return {"ok": True, **_worker_public(), "deployed": ok_deploy}
+
+
+@app.get("/api/tunnel/status")
+async def tunnel_status(_=Depends(require_auth)):
+    """Tunnel tab data: ping server→worker, details, logs."""
+    wdom = str(WORKER.get("worker_domain") or "").strip().lower()
+    ping_ms = None
+    if wdom:
+        t0 = time.time()
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(f"https://{wdom}/")
+            if r.status_code < 500:
+                ping_ms = round((time.time() - t0) * 1000)
+        except Exception:
+            ping_ms = None
+    tid = next((iid for iid, ib in INBOUNDS.items()
+                if ((ib or {}).get("protocol") or "").lower() == "tunnel"), None)
+    # Reverse info (shown under the tunnel info in the Tunnel tab).
+    rev_ping_ms = None
+    if wdom:
+        t0 = time.time()
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                r2 = await client.get(f"https://{wdom}/health")
+            if r2.status_code < 500:
+                rev_ping_ms = round((time.time() - t0) * 1000)
+        except Exception:
+            rev_ping_ms = None
+    return {
+        "ok": True,
+        "worker_connected": bool(WORKER.get("connected")),
+        "tunnel_enabled": bool(WORKER.get("tunnel_enabled")),
+        "inbound_exists": tid is not None,
+        "ping_ms": ping_ms,
+        "worker_url": WORKER.get("worker_url", ""),
+        "worker_domain": wdom,
+        "panel_domain": _safe_host(SETTINGS.get("domain"), get_host()),
+        "tunnel_kv_title": WORKER.get("tunnel_kv_namespace_title", ""),
+        "tunnel_kv_id": WORKER.get("tunnel_kv_namespace_id", ""),
+        "reverse_enabled": bool(tid and (INBOUNDS[tid] or {}).get("reverse_enabled")),
+        "reverse_ping_ms": rev_ping_ms,
+        "reverse_path": f"/reverse/{{uuid}}" if (tid and (INBOUNDS[tid] or {}).get("reverse_enabled")) else "",
+        "reverse_kv_title": WORKER.get("reverse_kv_namespace_title", ""),
+        "reverse_kv_id": WORKER.get("reverse_kv_namespace_id", ""),
+        "last_heartbeat": WORKER.get("last_heartbeat", ""),
+        "remote_status": WORKER.get("remote_status", ""),
+        "logs": list(WORKER.get("tunnel_logs") or [])[-30:],
+    }
+
+
+@app.post("/api/tunnel/reverse")
+async def tunnel_reverse_toggle(request: Request, _=Depends(require_auth)):
+    """Toggle reverse mode on the tunnel inbound.
+
+    ON:  user → Worker → Railway → site; config domain = worker domain,
+         ws path /reverse/{uuid}; user records live in REVERSE_KV.
+    OFF: back to the plain tunnel chain (user → Railway → Worker → site).
+    """
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+    if not WORKER.get("connected"):
+        raise HTTPException(status_code=400, detail="worker is not connected")
+    async with INBOUNDS_LOCK:
+        tid = next((iid for iid, ib in INBOUNDS.items()
+                    if ((ib or {}).get("protocol") or "").lower() == "tunnel"), None)
+        if not tid:
+            raise HTTPException(status_code=400, detail="ابتدا اینباند Tunnel را بسازید")
+        INBOUNDS[tid]["reverse_enabled"] = enabled
+    if enabled:
+        kv_ok = await _ensure_reverse_kv()
+        if not kv_ok:
+            raise HTTPException(status_code=500, detail="could not create reverse KV namespace")
+        async with WORKER_LOCK:
+            _tunnel_log(f"Reverse KV آماده شد: {WORKER.get('reverse_kv_namespace_title')}")
+    # Re-deploy so the REVERSE_KV binding goes live when first needed.
+    sc, sd = await _worker_deploy()
+    ok_deploy = sc in (200, 201, 409)
+    wdom = str(WORKER.get("worker_domain") or "")
+    async with WORKER_LOCK:
+        if enabled:
+            _tunnel_log(f"Reverse فعال شد — دامنه {wdom} با مسیر /reverse/{{uuid}}")
+            _tunnel_log("Worker با REVERSE_KV deploy شد" if ok_deploy else f"deploy ناموفق: {sc}")
+        else:
+            _tunnel_log("Reverse غیرفعال شد")
+    log_activity("tunnel", f"Reverse {'فعال' if enabled else 'غیرفعال'} شد", "ok")
+    asyncio.create_task(save_state())
+    return {"ok": True, "enabled": enabled, **_worker_public(), "deployed": ok_deploy}
+
 
 @app.get("/api/scanner/ips/{ctype}")
 async def scanner_get_ips(ctype: str, _=Depends(require_auth)):

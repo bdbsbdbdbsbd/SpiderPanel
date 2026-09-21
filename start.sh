@@ -942,6 +942,11 @@ SPIDER_DATA_DIR=$APP_DIR/data
 XRAY_BIN=$XRAY
 MTPROTO_PROXY_BIN=$MTPROXY
 RAILWAY_PUBLIC_DOMAIN=
+WORKER_SYNC_INTERVAL=3600
+SPIDER_PANEL_PUBLIC_URL=
+SPIDER_PANEL_PUBLIC_DOMAIN=
+PUBLIC_ENDPOINT_RETRY_SECONDS=5
+PUBLIC_ENDPOINT_REFRESH_SECONDS=60
 PYTHONUNBUFFERED=1
 PYTHONDONTWRITEBYTECODE=1
 PIP_NO_CACHE_DIR=1
@@ -1550,19 +1555,31 @@ info_panel() {
     echo "================================================"
 
 
-    echo "URL: http://127.0.0.1:8080/spider"
+    local listen_port="8080"
+    if [[ -f "$ENV_FILE" ]]; then
+        listen_port="$(
+            grep '^PORT=' "$ENV_FILE" 2>/dev/null \
+            | head -n1 \
+            | cut -d= -f2- \
+            || echo "8080"
+        )"
+    fi
+    [[ "$listen_port" =~ ^[0-9]+$ ]] || listen_port="8080"
+
+    echo "URL: http://127.0.0.1:${listen_port}/spider"
 
 
     if [[ -n "$local_ip" ]]; then
 
-        echo "Local URL: http://${local_ip}:8080/spider"
+        echo "Local URL: http://${local_ip}:${listen_port}/spider"
 
     fi
 
 
     if [[ -n "$ip" ]]; then
 
-        echo "Public URL: http://${ip}:8080/spider"
+        echo "Public URL: http://${ip}:${listen_port}/spider"
+        echo "Public domain: auto-discovered (or set SPIDER_PANEL_PUBLIC_URL)"
 
     fi
 

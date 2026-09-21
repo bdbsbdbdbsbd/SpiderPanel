@@ -253,8 +253,12 @@ def _html(s: str) -> str:
 
 # ── Panel helpers ───────────────────────────────────────────────────────────
 def _pick_inbounds() -> list:
-    """Choose the best inbounds for a bot-created user (default TLS+WS relay)."""
+    """Choose the best inbounds for a bot-created user:
+    worker inbound (if the worker is connected) then the default TLS+WS relay."""
     ids: list = []
+    wid = next((i for i, ib in P.INBOUNDS.items() if (ib.get("protocol") or "").lower() == "worker"), None)
+    if wid and P.WORKER.get("connected") is True:
+        ids.append(wid)
     dws = P.find_default_tls_ws_inbound_id()
     if dws and dws not in ids:
         ids.append(dws)
@@ -318,7 +322,7 @@ def _usage_bar(pct: float, width: int = 12) -> str:
 
 
 async def _sub_report(user: dict) -> dict:
-    """Build the subscription report for a user."""
+    """Build the worker-style subscription report for a user."""
     cuuid = user.get("config_uuid") or ""
     try:
         sub_url = P.get_bot_sub_link(cuuid) or P.sub_hash_url(cuuid) or ""
@@ -327,6 +331,7 @@ async def _sub_report(user: dict) -> dict:
     data = await P._build_subscription_data_by_uuid(cuuid)
     configs = data.get("configs") or []
     vless = data.get("vless_link") or data.get("config") or (configs[0] if configs else "")
+    worker_lines = [c for c in configs if "/ws/" in c and c.startswith("vless://")]
     return {
         "username": data.get("username") or user.get("username") or cuuid,
         "status": data.get("status") or "active",
@@ -342,6 +347,7 @@ async def _sub_report(user: dict) -> dict:
         "sub_url": sub_url,
         "hash": (sub_url.rsplit("/", 1)[-1] if "/sub/" in sub_url else ""),
         "vless": vless,
+        "worker_count": len(worker_lines),
         "configs": configs,
         "max_ips": data.get("max_ip_per_user") or 0,
         "used_ips": data.get("used_ips") or 0,
@@ -385,6 +391,8 @@ async def _extend_user(chat_id, tg_user, add_gb: float, add_days: int, note: str
                 P.LINKS[cuuid]["expires_at"] = uu.get("expire_at")
                 P.LINKS[cuuid]["active"] = True
     await P.save_state()
+    if P.WORKER.get("connected") is True and (cuuid in P.LINKS and P._user_uses_worker_inbound(uu)):
+        asyncio.create_task(P._worker_sync_users())
     if note:
         P.log_activity("user", f"{note} برای «{uu.get('username')}» از ربات", "ok")
     return uu, created
@@ -544,13 +552,18 @@ async def _create_sub_user(chat_id: int, tg_user: dict, username: str, limit_gb:
         }
         P.PATH_INDEX[config_uuid] = config_uuid
         P.PATH_INDEX[path.lstrip("/")] = config_uuid
-    # Pre-create the sub hash so the first /sub/{hash} resolves.
+    # Pre-create the worker-style sub hash so the first /sub/{hash} resolves.
     try:
         P.ensure_sub_hash(config_uuid)
     except Exception:
         pass
 
     await P.save_state()
+    if any((P.INBOUNDS.get(iid) or {}).get("protocol") == "worker" for iid in inbound_ids) and P.WORKER.get("connected") is True:
+        try:
+            await P._worker_sync_users()
+        except Exception as exc:
+            logger.warning("worker sync after bot user failed: %s", exc)
     try:
         asyncio.create_task(P._xray_apply())
     except Exception:
@@ -1161,6 +1174,8 @@ async def _menu_toggle_service(chat_id, msg_id):
             if cuuid in P.LINKS:
                 P.LINKS[cuuid]["active"] = new == "active"
     await P.save_state()
+    if P.WORKER.get("connected") is True and (cuuid in P.LINKS and P._user_uses_worker_inbound(P.USERS.get(uid, {}))):
+        asyncio.create_task(P._worker_sync_users())
     P.log_activity("user", f"سرویس «{user.get('username')}» از ربات {'متوقف' if new=='disabled' else 'فعال'} شد",
                    "warn" if new == "disabled" else "ok")
     txt = f"✅ سرویس به حالت «{('⏸ متوقف' if new == 'disabled' else '▶️ فعال')}» تغییر کرد."
@@ -1181,6 +1196,8 @@ async def _menu_delete_service(chat_id, msg_id, tg_user):
                 if P.PATH_INDEX[k] == cuuid:
                     P.PATH_INDEX.pop(k, None)
     await P.save_state()
+    if P.WORKER.get("connected") is True and P._user_uses_worker_inbound(user):
+        asyncio.create_task(P._worker_sync_users())
     P.log_activity("user", f"سرویس «{user.get('username')}» از ربات حذف شد", "err")
     await _edit(chat_id, msg_id, "🗑 سرویس شما حذف شد. هر وقت خواستی دوباره بخر یا تست رایگان بگیر.",
                 buttons=[[{"text": "🛒 خرید", "callback_data": "u:buy"},
@@ -1202,6 +1219,8 @@ def _fmt_subscription(r: dict) -> str:
                      + (f" ({r['expire_days']} روز مانده)" if r.get("expire_days") is not None else ""))
     else:
         lines.append("⏳ انقضا: نامحدود ♾")
+    if r.get("worker_count"):
+        lines.append(f"🌍 کانفیگ Worker (چندلوکیشن): {r['worker_count']} عدد")
     lines += [
         "",
         "🔗 <b>لینک سابسکریپشن:</b>",
@@ -1390,6 +1409,7 @@ async def _cmd_stats(chat_id):
         f"🔗 لینک‌ها: <b>{len(links)}</b>",
         f"🧾 رسیدهای در انتظار: <b>{pending}</b>",
         "",
+        f"🌐 Worker متصل: {'✅' if P.WORKER.get('connected') is True else '⛔'}",
         f"ℹ️ آپ‌تایم: {P.uptime()}",
     ]
     await _send(chat_id, "\n".join(lines))
@@ -1442,6 +1462,8 @@ async def _cmd_toggle(chat_id, args):
             if cuuid in P.LINKS:
                 P.LINKS[cuuid]["active"] = new == "active"
     await P.save_state()
+    if P.WORKER.get("connected") is True and (cuuid in P.LINKS and P._user_uses_worker_inbound(P.USERS.get(uid, {}))):
+        asyncio.create_task(P._worker_sync_users())
     P.log_activity("user", f"کاربر «{u.get('username')}» از ربات {'غیرفعال' if new=='disabled' else 'فعال'} شد", "warn" if new=="disabled" else "ok")
     await _send(chat_id, f"👤 {_html(u.get('username'))} → وضعیت: <b>{'⚡ فعال' if new=='active' else '⛔ غیرفعال'}</b>")
 
@@ -1461,6 +1483,8 @@ async def _cmd_reset(chat_id, args):
             if cuuid in P.LINKS:
                 P.LINKS[cuuid]["used_bytes"] = 0
     await P.save_state()
+    if P.WORKER.get("connected") is True and (cuuid in P.LINKS and P._user_uses_worker_inbound(P.USERS.get(uid, {}))):
+        asyncio.create_task(P._worker_sync_users())
     P.log_activity("user", f"مصرف کاربر «{u.get('username')}» از ربات ریست شد", "info")
     await _send(chat_id, f"✅ مصرف کاربر <b>{_html(u.get('username'))}</b> صفر شد.")
 
@@ -1501,6 +1525,8 @@ async def _cmd_extend(chat_id, args):
                 P.LINKS[cuuid]["expires_at"] = new_exp.isoformat()
                 P.LINKS[cuuid]["active"] = True
     await P.save_state()
+    if P.WORKER.get("connected") is True and P._user_uses_worker_inbound(u):
+        asyncio.create_task(P._worker_sync_users())
     P.log_activity("user", f"اشتراک «{u.get('username')}» به مدت {d} روز تمدید شد", "ok")
     await _send(chat_id, f"✅ اشتراک <b>{_html(u.get('username'))}</b> تا <code>{new_exp.isoformat()}</code> تمدید شد.")
 
@@ -1521,6 +1547,8 @@ async def _cmd_delete(chat_id, args):
                 if P.PATH_INDEX[k] == cuuid:
                     P.PATH_INDEX.pop(k, None)
     await P.save_state()
+    if P.WORKER.get("connected") is True and P._user_uses_worker_inbound(u):
+        asyncio.create_task(P._worker_sync_users())
     P.log_activity("user", f"کاربر «{u.get('username')}» از ربات حذف شد", "err")
     await _send(chat_id, f"🗑 کاربر <b>{_html(u.get('username'))}</b> حذف شد.")
 
